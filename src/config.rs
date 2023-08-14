@@ -1,62 +1,35 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
 
+use clap::parser::ValueSource;
 use regex::Regex;
-use structopt::clap;
 use syntect::highlighting::Style as SyntectStyle;
 use syntect::highlighting::Theme as SyntaxTheme;
 use syntect::parsing::SyntaxSet;
-use unicode_segmentation::UnicodeSegmentation;
 
 use crate::ansi;
 use crate::cli;
 use crate::color;
 use crate::delta::State;
-use crate::env;
 use crate::fatal;
 use crate::features::navigate;
 use crate::features::side_by_side::{self, ansifill, LeftRight};
-use crate::git_config::{GitConfig, GitConfigEntry};
+use crate::git_config::GitConfig;
 use crate::handlers;
+use crate::handlers::blame::parse_blame_line_numbers;
+use crate::handlers::blame::BlameLineNumbers;
 use crate::minusplus::MinusPlus;
 use crate::paint::BgFillMethod;
 use crate::parse_styles;
 use crate::style;
 use crate::style::Style;
 use crate::tests::TESTING;
+use crate::utils;
 use crate::utils::bat::output::PagingMode;
 use crate::utils::regex_replacement::RegexReplacement;
-use crate::utils::syntect::FromDeltaStyle;
 use crate::wrapping::WrapConfig;
 
 pub const INLINE_SYMBOL_WIDTH_1: usize = 1;
-
-fn remove_percent_suffix(arg: &str) -> &str {
-    match &arg.strip_suffix('%') {
-        Some(s) => s,
-        None => arg,
-    }
-}
-
-fn ensure_display_width_1(what: &str, arg: String) -> String {
-    match arg.grapheme_indices(true).count() {
-        INLINE_SYMBOL_WIDTH_1 => arg,
-        width => fatal(format!(
-            "Invalid value for {}, display width of \"{}\" must be {} but is {}",
-            what, arg, INLINE_SYMBOL_WIDTH_1, width
-        )),
-    }
-}
-
-fn adapt_wrap_max_lines_argument(arg: String) -> usize {
-    if arg == "∞" || arg == "unlimited" || arg.starts_with("inf") {
-        0
-    } else {
-        arg.parse::<usize>()
-            .unwrap_or_else(|err| fatal(format!("Invalid wrap-max-lines argument: {}", err)))
-            + 1
-    }
-}
 
 #[cfg_attr(test, derive(Clone))]
 pub struct Config {
@@ -64,13 +37,16 @@ pub struct Config {
     pub background_color_extends_to_terminal_width: bool,
     pub blame_code_style: Option<Style>,
     pub blame_format: String,
+    pub blame_separator_format: BlameLineNumbers,
     pub blame_palette: Vec<String>,
-    pub blame_separator: String,
     pub blame_separator_style: Option<Style>,
     pub blame_timestamp_format: String,
+    pub blame_timestamp_output_format: Option<String>,
     pub color_only: bool,
     pub commit_regex: Regex,
     pub commit_style: Style,
+    pub cwd_of_delta_process: Option<PathBuf>,
+    pub cwd_of_user_shell_process: Option<PathBuf>,
     pub cwd_relative_to_repo_root: Option<String>,
     pub decorations_width: cli::Width,
     pub default_language: Option<String>,
@@ -84,21 +60,24 @@ pub struct Config {
     pub file_regex_replacement: Option<RegexReplacement>,
     pub right_arrow: String,
     pub file_style: Style,
-    pub git_config_entries: HashMap<String, GitConfigEntry>,
     pub git_config: Option<GitConfig>,
     pub git_minus_style: Style,
     pub git_plus_style: Style,
     pub grep_context_line_style: Style,
     pub grep_file_style: Style,
+    pub classic_grep_header_file_style: Style,
+    pub classic_grep_header_style: Style,
+    pub ripgrep_header_style: Style,
     pub grep_line_number_style: Style,
     pub grep_match_line_style: Style,
     pub grep_match_word_style: Style,
+    pub grep_output_type: Option<GrepType>,
     pub grep_separator_symbol: String,
     pub handle_merge_conflicts: bool,
     pub hunk_header_file_style: Style,
     pub hunk_header_line_number_style: Style,
-    pub hunk_header_style_include_file_path: bool,
-    pub hunk_header_style_include_line_number: bool,
+    pub hunk_header_style_include_file_path: HunkHeaderIncludeFilePath,
+    pub hunk_header_style_include_line_number: HunkHeaderIncludeLineNumber,
     pub hunk_header_style: Style,
     pub hunk_label: String,
     pub hyperlinks_commit_link_format: Option<String>,
@@ -145,13 +124,31 @@ pub struct Config {
     pub syntax_dummy_theme: SyntaxTheme,
     pub syntax_set: SyntaxSet,
     pub syntax_theme: Option<SyntaxTheme>,
-    pub tab_width: usize,
+    pub tab_cfg: utils::tabs::TabCfg,
     pub tokenization_regex: Regex,
     pub true_color: bool,
     pub truncation_symbol: String,
     pub whitespace_error_style: Style,
     pub wrap_config: WrapConfig,
     pub zero_style: Style,
+}
+
+#[derive(Debug, Eq, PartialEq, Clone)]
+pub enum GrepType {
+    Ripgrep,
+    Classic,
+}
+
+#[cfg_attr(test, derive(Clone))]
+pub enum HunkHeaderIncludeFilePath {
+    Yes,
+    No,
+}
+
+#[cfg_attr(test, derive(Clone))]
+pub enum HunkHeaderIncludeLineNumber {
+    Yes,
+    No,
 }
 
 impl Config {
@@ -162,10 +159,15 @@ impl Config {
             State::HunkPlus(_, _) => &self.plus_style,
             State::CommitMeta => &self.commit_style,
             State::DiffHeader(_) => &self.file_style,
+            State::Grep(GrepType::Ripgrep, _, _, _) => &self.classic_grep_header_style,
             State::HunkHeader(_, _, _, _) => &self.hunk_header_style,
             State::SubmoduleLog => &self.file_style,
             _ => delta_unreachable("Unreachable code reached in get_style."),
         }
+    }
+
+    pub fn git_config(&self) -> Option<&GitConfig> {
+        self.git_config.as_ref()
     }
 }
 
@@ -174,10 +176,14 @@ impl From<cli::Opt> for Config {
         let mut styles = parse_styles::parse_styles(&opt);
         let styles_map = parse_styles::parse_styles_map(&opt);
 
-        let max_line_distance_for_naively_paired_lines =
-            env::get_env_var("DELTA_EXPERIMENTAL_MAX_LINE_DISTANCE_FOR_NAIVELY_PAIRED_LINES")
-                .map(|s| s.parse::<f64>().unwrap_or(0.0))
-                .unwrap_or(0.0);
+        let wrap_config = WrapConfig::from_opt(&opt, styles["inline-hint-style"]);
+
+        let max_line_distance_for_naively_paired_lines = opt
+            .env
+            .experimental_max_line_distance_for_naively_paired_lines
+            .as_ref()
+            .map(|s| s.parse::<f64>().unwrap_or(0.0))
+            .unwrap_or(0.0);
 
         let commit_regex = Regex::new(&opt.commit_regex).unwrap_or_else(|_| {
             fatal(format!(
@@ -239,7 +245,24 @@ impl From<cli::Opt> for Config {
             opt.navigate_regex
         };
 
-        let wrap_max_lines_plus1 = adapt_wrap_max_lines_argument(opt.wrap_max_lines);
+        let grep_output_type = match opt.grep_output_type.as_deref() {
+            Some("ripgrep") => Some(GrepType::Ripgrep),
+            Some("classic") => Some(GrepType::Classic),
+            None => None,
+            _ => fatal("Invalid option for grep-output-type: Expected \"ripgrep\" or \"classic\"."),
+        };
+
+        #[cfg(not(test))]
+        let cwd_of_delta_process = opt.env.current_dir;
+        #[cfg(test)]
+        let cwd_of_delta_process = Some(utils::path::fake_delta_cwd_for_tests());
+
+        let cwd_relative_to_repo_root = opt.env.git_prefix;
+
+        let cwd_of_user_shell_process = utils::path::cwd_of_user_shell_process(
+            cwd_of_delta_process.as_ref(),
+            cwd_relative_to_repo_root.as_deref(),
+        );
 
         Self {
             available_terminal_width: opt.computed.available_terminal_width,
@@ -249,13 +272,16 @@ impl From<cli::Opt> for Config {
             blame_format: opt.blame_format,
             blame_code_style: styles.remove("blame-code-style"),
             blame_palette,
-            blame_separator: opt.blame_separator,
+            blame_separator_format: parse_blame_line_numbers(&opt.blame_separator_format),
             blame_separator_style: styles.remove("blame-separator-style"),
             blame_timestamp_format: opt.blame_timestamp_format,
+            blame_timestamp_output_format: opt.blame_timestamp_output_format,
             commit_style: styles["commit-style"],
             color_only: opt.color_only,
             commit_regex,
-            cwd_relative_to_repo_root: std::env::var("GIT_PREFIX").ok(),
+            cwd_of_delta_process,
+            cwd_of_user_shell_process,
+            cwd_relative_to_repo_root,
             decorations_width: opt.computed.decorations_width,
             default_language: opt.default_language,
             diff_stat_align_width: opt.diff_stat_align_width,
@@ -268,31 +294,43 @@ impl From<cli::Opt> for Config {
             file_regex_replacement: opt
                 .file_regex_replacement
                 .as_deref()
-                .map(RegexReplacement::from_sed_command)
-                .flatten(),
+                .and_then(RegexReplacement::from_sed_command),
             right_arrow,
             hunk_label,
             file_style: styles["file-style"],
             git_config: opt.git_config,
-            git_config_entries: opt.git_config_entries,
             grep_context_line_style: styles["grep-context-line-style"],
             grep_file_style: styles["grep-file-style"],
+            classic_grep_header_file_style: styles["classic-grep-header-file-style"],
+            classic_grep_header_style: styles["classic-grep-header-style"],
+            ripgrep_header_style: styles["ripgrep-header-style"],
             grep_line_number_style: styles["grep-line-number-style"],
             grep_match_line_style: styles["grep-match-line-style"],
             grep_match_word_style: styles["grep-match-word-style"],
+            grep_output_type,
             grep_separator_symbol: opt.grep_separator_symbol,
             handle_merge_conflicts: !opt.raw,
             hunk_header_file_style: styles["hunk-header-file-style"],
             hunk_header_line_number_style: styles["hunk-header-line-number-style"],
             hunk_header_style: styles["hunk-header-style"],
-            hunk_header_style_include_file_path: opt
+            hunk_header_style_include_file_path: if opt
                 .hunk_header_style
                 .split(' ')
-                .any(|s| s == "file"),
-            hunk_header_style_include_line_number: opt
+                .any(|s| s == "file")
+            {
+                HunkHeaderIncludeFilePath::Yes
+            } else {
+                HunkHeaderIncludeFilePath::No
+            },
+            hunk_header_style_include_line_number: if opt
                 .hunk_header_style
                 .split(' ')
-                .any(|s| s == "line-number"),
+                .any(|s| s == "line-number")
+            {
+                HunkHeaderIncludeLineNumber::Yes
+            } else {
+                HunkHeaderIncludeLineNumber::No
+            },
             hyperlinks: opt.hyperlinks,
             hyperlinks_commit_link_format: opt.hyperlinks_commit_link_format,
             hyperlinks_file_link_format: opt.hyperlinks_file_link_format,
@@ -324,22 +362,13 @@ impl From<cli::Opt> for Config {
             line_buffer_size: opt.line_buffer_size,
             max_line_distance: opt.max_line_distance,
             max_line_distance_for_naively_paired_lines,
-            max_line_length: match (opt.side_by_side, wrap_max_lines_plus1) {
-                (false, _) | (true, 1) => opt.max_line_length,
-                // Ensure there is enough text to wrap, either don't truncate the input at all (0)
-                // or ensure there is enough for the requested number of lines.
-                // The input can contain ANSI sequences, so round up a bit. This is enough for
-                // normal `git diff`, but might not be with ANSI heavy input.
-                (true, 0) => 0,
-                (true, wrap_max_lines) => {
-                    let single_pane_width = opt.computed.available_terminal_width / 2;
-                    let add_25_percent_or_term_width =
-                        |x| x + std::cmp::max((x * 250) / 1000, single_pane_width) as usize;
-                    std::cmp::max(
-                        opt.max_line_length,
-                        add_25_percent_or_term_width(single_pane_width * wrap_max_lines),
-                    )
-                }
+            max_line_length: if opt.side_by_side {
+                wrap_config.config_max_line_length(
+                    opt.max_line_length,
+                    opt.computed.available_terminal_width,
+                )
+            } else {
+                opt.max_line_length
             },
             merge_conflict_begin_symbol: opt.merge_conflict_begin_symbol,
             merge_conflict_ours_diff_header_style: styles["merge-conflict-ours-diff-header-style"],
@@ -372,38 +401,11 @@ impl From<cli::Opt> for Config {
             syntax_dummy_theme: SyntaxTheme::default(),
             syntax_set: opt.computed.syntax_set,
             syntax_theme: opt.computed.syntax_theme,
-            tab_width: opt.tab_width,
+            tab_cfg: utils::tabs::TabCfg::new(opt.tab_width),
             tokenization_regex,
             true_color: opt.computed.true_color,
             truncation_symbol: format!("{}→{}", ansi::ANSI_SGR_REVERSE, ansi::ANSI_SGR_RESET),
-            wrap_config: WrapConfig {
-                left_symbol: ensure_display_width_1("wrap-left-symbol", opt.wrap_left_symbol),
-                right_symbol: ensure_display_width_1("wrap-right-symbol", opt.wrap_right_symbol),
-                right_prefix_symbol: ensure_display_width_1(
-                    "wrap-right-prefix-symbol",
-                    opt.wrap_right_prefix_symbol,
-                ),
-                use_wrap_right_permille: {
-                    let arg = &opt.wrap_right_percent;
-                    let percent = remove_percent_suffix(arg)
-                        .parse::<f64>()
-                        .unwrap_or_else(|err| {
-                            fatal(format!(
-                                "Could not parse wrap-right-percent argument {}: {}.",
-                                &arg, err
-                            ))
-                        });
-                    if percent.is_finite() && percent > 0.0 && percent < 100.0 {
-                        (percent * 10.0).round() as usize
-                    } else {
-                        fatal("Invalid value for wrap-right-percent, not between 0 and 100.")
-                    }
-                },
-                max_lines: wrap_max_lines_plus1,
-                inline_hint_syntect_style: SyntectStyle::from_delta_style(
-                    styles["inline-hint-style"],
-                ),
-            },
+            wrap_config,
             whitespace_error_style: styles["whitespace-error-style"],
             zero_style: styles["zero-style"],
         }
@@ -429,14 +431,13 @@ fn make_blame_palette(blame_palette: Option<String>, is_light_mode: bool) -> Vec
 
 /// Did the user supply `option` on the command line?
 pub fn user_supplied_option(option: &str, arg_matches: &clap::ArgMatches) -> bool {
-    arg_matches.occurrences_of(option) > 0
+    arg_matches.value_source(option) == Some(ValueSource::CommandLine)
 }
 
 pub fn delta_unreachable(message: &str) -> ! {
     fatal(format!(
-        "{} This should not be possible. \
+        "{message} This should not be possible. \
          Please report the bug at https://github.com/dandavison/delta/issues.",
-        message
     ));
 }
 

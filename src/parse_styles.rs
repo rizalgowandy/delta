@@ -3,7 +3,7 @@ use std::collections::{HashMap, HashSet};
 use crate::cli;
 use crate::color;
 use crate::fatal;
-use crate::git_config::{GitConfig, GitConfigEntry};
+use crate::git_config::GitConfig;
 use crate::style::{self, Style};
 
 #[derive(Debug, Clone)]
@@ -68,7 +68,7 @@ fn resolve_style_references(
         loop {
             if !visited.insert(node) {
                 #[cfg(not(test))]
-                fatal(format!("Your delta styles form a cycle! {:?}", visited));
+                fatal(format!("Your delta styles form a cycle! {visited:?}"));
                 #[cfg(test)]
                 return [("__cycle__", Style::default())]
                     .iter()
@@ -92,26 +92,24 @@ fn resolve_style_references(
 }
 
 fn parse_as_style_or_reference_to_git_config(style_string: &str, opt: &cli::Opt) -> Style {
-    match style_from_str(style_string, None, None, true, opt.git_config.as_ref()) {
+    match style_from_str(style_string, None, None, true, opt.git_config()) {
         StyleReference::Reference(style_ref) => parse_as_reference_to_git_config(&style_ref, opt),
         StyleReference::Style(style) => style,
     }
 }
 
 fn parse_as_reference_to_git_config(style_string: &str, opt: &cli::Opt) -> Style {
-    if let Some(git_config) = &opt.git_config {
-        let git_config_key = format!("delta.{}", style_string);
+    if let Some(git_config) = opt.git_config() {
+        let git_config_key = format!("delta.{style_string}");
         match git_config.get::<String>(&git_config_key) {
             Some(s) => Style::from_git_str(&s),
             _ => fatal(format!(
-                "Style key not found in git config: {}",
-                git_config_key
+                "Style key not found in git config: {git_config_key}",
             )),
         }
     } else {
         fatal(format!(
-            "Style not found (git config unavailable): {}",
-            style_string
+            "Style not found (git config unavailable): {style_string}",
         ));
     }
 }
@@ -130,7 +128,7 @@ fn make_hunk_styles<'a>(opt: &'a cli::Opt, styles: &'a mut HashMap<&str, StyleRe
         )),
         None,
         true_color,
-        opt.git_config.as_ref(),
+        opt.git_config(),
     );
 
     let minus_emph_style = style_from_str(
@@ -144,7 +142,7 @@ fn make_hunk_styles<'a>(opt: &'a cli::Opt, styles: &'a mut HashMap<&str, StyleRe
         )),
         None,
         true_color,
-        opt.git_config.as_ref(),
+        opt.git_config(),
     );
 
     let minus_non_emph_style = style_from_str(
@@ -152,7 +150,7 @@ fn make_hunk_styles<'a>(opt: &'a cli::Opt, styles: &'a mut HashMap<&str, StyleRe
         None,
         None,
         true_color,
-        opt.git_config.as_ref(),
+        opt.git_config(),
     );
 
     // The style used to highlight a removed empty line when otherwise it would be invisible due to
@@ -168,16 +166,10 @@ fn make_hunk_styles<'a>(opt: &'a cli::Opt, styles: &'a mut HashMap<&str, StyleRe
         )),
         None,
         true_color,
-        opt.git_config.as_ref(),
+        opt.git_config(),
     );
 
-    let zero_style = style_from_str(
-        &opt.zero_style,
-        None,
-        None,
-        true_color,
-        opt.git_config.as_ref(),
-    );
+    let zero_style = style_from_str(&opt.zero_style, None, None, true_color, opt.git_config());
 
     let plus_style = style_from_str(
         &opt.plus_style,
@@ -190,7 +182,7 @@ fn make_hunk_styles<'a>(opt: &'a cli::Opt, styles: &'a mut HashMap<&str, StyleRe
         )),
         None,
         true_color,
-        opt.git_config.as_ref(),
+        opt.git_config(),
     );
 
     let plus_emph_style = style_from_str(
@@ -204,7 +196,7 @@ fn make_hunk_styles<'a>(opt: &'a cli::Opt, styles: &'a mut HashMap<&str, StyleRe
         )),
         None,
         true_color,
-        opt.git_config.as_ref(),
+        opt.git_config(),
     );
 
     let plus_non_emph_style = style_from_str(
@@ -212,7 +204,7 @@ fn make_hunk_styles<'a>(opt: &'a cli::Opt, styles: &'a mut HashMap<&str, StyleRe
         None,
         None,
         true_color,
-        opt.git_config.as_ref(),
+        opt.git_config(),
     );
 
     // The style used to highlight an added empty line when otherwise it would be invisible due to
@@ -228,7 +220,7 @@ fn make_hunk_styles<'a>(opt: &'a cli::Opt, styles: &'a mut HashMap<&str, StyleRe
         )),
         None,
         true_color,
-        opt.git_config.as_ref(),
+        opt.git_config(),
     );
 
     let whitespace_error_style = style_from_str(
@@ -236,7 +228,7 @@ fn make_hunk_styles<'a>(opt: &'a cli::Opt, styles: &'a mut HashMap<&str, StyleRe
         None,
         None,
         true_color,
-        opt.git_config.as_ref(),
+        opt.git_config(),
     );
 
     styles.extend([
@@ -263,7 +255,7 @@ fn make_line_number_styles(opt: &cli::Opt, styles: &mut HashMap<&str, StyleRefer
         None,
         None,
         true_color,
-        opt.git_config.as_ref(),
+        opt.git_config(),
     );
 
     let line_numbers_minus_style = style_from_str(
@@ -271,7 +263,7 @@ fn make_line_number_styles(opt: &cli::Opt, styles: &mut HashMap<&str, StyleRefer
         None,
         None,
         true_color,
-        opt.git_config.as_ref(),
+        opt.git_config(),
     );
 
     let line_numbers_zero_style = style_from_str(
@@ -279,7 +271,7 @@ fn make_line_number_styles(opt: &cli::Opt, styles: &mut HashMap<&str, StyleRefer
         None,
         None,
         true_color,
-        opt.git_config.as_ref(),
+        opt.git_config(),
     );
 
     let line_numbers_plus_style = style_from_str(
@@ -287,7 +279,7 @@ fn make_line_number_styles(opt: &cli::Opt, styles: &mut HashMap<&str, StyleRefer
         None,
         None,
         true_color,
-        opt.git_config.as_ref(),
+        opt.git_config(),
     );
 
     let line_numbers_right_style = style_from_str(
@@ -295,7 +287,7 @@ fn make_line_number_styles(opt: &cli::Opt, styles: &mut HashMap<&str, StyleRefer
         None,
         None,
         true_color,
-        opt.git_config.as_ref(),
+        opt.git_config(),
     );
 
     styles.extend([
@@ -310,53 +302,99 @@ fn make_line_number_styles(opt: &cli::Opt, styles: &mut HashMap<&str, StyleRefer
 fn make_commit_file_hunk_header_styles(opt: &cli::Opt, styles: &mut HashMap<&str, StyleReference>) {
     let true_color = opt.computed.true_color;
     styles.extend([
-        ("commit-style",
-            style_from_str_with_handling_of_special_decoration_attributes_and_respecting_deprecated_foreground_color_arg(
+        (
+            "commit-style",
+            style_from_str_with_handling_of_special_decoration_attributes(
                 &opt.commit_style,
                 None,
                 Some(&opt.commit_decoration_style),
-                opt.deprecated_commit_color.as_deref(),
                 true_color,
-                opt.git_config.as_ref(),
-            )
+                opt.git_config(),
+            ),
         ),
-        ("file-style",
-            style_from_str_with_handling_of_special_decoration_attributes_and_respecting_deprecated_foreground_color_arg(
+        (
+            "file-style",
+            style_from_str_with_handling_of_special_decoration_attributes(
                 &opt.file_style,
                 None,
                 Some(&opt.file_decoration_style),
-                opt.deprecated_file_color.as_deref(),
                 true_color,
-                opt.git_config.as_ref(),
-            )
+                opt.git_config(),
+            ),
         ),
-        ("hunk-header-style",
-            style_from_str_with_handling_of_special_decoration_attributes_and_respecting_deprecated_foreground_color_arg(
+        (
+            "classic-grep-header-style",
+            style_from_str_with_handling_of_special_decoration_attributes(
+                opt.hunk_header_style.as_str(),
+                None,
+                opt.grep_header_decoration_style
+                    .as_deref()
+                    .or(Some(opt.hunk_header_decoration_style.as_str())),
+                true_color,
+                opt.git_config(),
+            ),
+        ),
+        (
+            "ripgrep-header-style",
+            style_from_str_with_handling_of_special_decoration_attributes(
+                "file",
+                None,
+                opt.grep_header_decoration_style.as_deref().or(Some("none")),
+                true_color,
+                opt.git_config(),
+            ),
+        ),
+        (
+            "hunk-header-style",
+            style_from_str_with_handling_of_special_decoration_attributes(
                 &opt.hunk_header_style,
                 None,
                 Some(&opt.hunk_header_decoration_style),
-                opt.deprecated_hunk_color.as_deref(),
                 true_color,
-                opt.git_config.as_ref(),
-            )
+                opt.git_config(),
+            ),
         ),
-        ("hunk-header-file-style",
+        (
+            "hunk-header-file-style",
             style_from_str_with_handling_of_special_decoration_attributes(
                 &opt.hunk_header_file_style,
                 None,
                 None,
                 true_color,
-                opt.git_config.as_ref(),
-            )
+                opt.git_config(),
+            ),
         ),
-        ("hunk-header-line-number-style",
+        (
+            "classic-grep-header-file-style",
+            style_from_str_with_handling_of_special_decoration_attributes(
+                opt.grep_header_file_style
+                    .as_deref()
+                    .unwrap_or(opt.hunk_header_file_style.as_str()),
+                None,
+                None,
+                true_color,
+                opt.git_config(),
+            ),
+        ),
+        (
+            "ripgrep-header-file-style",
+            style_from_str_with_handling_of_special_decoration_attributes(
+                opt.grep_header_file_style.as_deref().unwrap_or("magenta"),
+                None,
+                None,
+                true_color,
+                opt.git_config(),
+            ),
+        ),
+        (
+            "hunk-header-line-number-style",
             style_from_str_with_handling_of_special_decoration_attributes(
                 &opt.hunk_header_line_number_style,
                 None,
                 None,
                 true_color,
-                opt.git_config.as_ref(),
-            )
+                opt.git_config(),
+            ),
         ),
     ]);
 }
@@ -370,7 +408,7 @@ fn make_blame_styles(opt: &cli::Opt, styles: &mut HashMap<&str, StyleReference>)
                 None,
                 None,
                 opt.computed.true_color,
-                opt.git_config.as_ref(),
+                opt.git_config(),
             ),
         );
     };
@@ -382,7 +420,7 @@ fn make_blame_styles(opt: &cli::Opt, styles: &mut HashMap<&str, StyleReference>)
                 None,
                 None,
                 opt.computed.true_color,
-                opt.git_config.as_ref(),
+                opt.git_config(),
             ),
         );
     };
@@ -393,13 +431,7 @@ fn make_grep_styles(opt: &cli::Opt, styles: &mut HashMap<&str, StyleReference>) 
         (
             "grep-match-line-style",
             if let Some(s) = &opt.grep_match_line_style {
-                style_from_str(
-                    s,
-                    None,
-                    None,
-                    opt.computed.true_color,
-                    opt.git_config.as_ref(),
-                )
+                style_from_str(s, None, None, opt.computed.true_color, opt.git_config())
             } else {
                 StyleReference::Reference("zero-style".to_owned())
             },
@@ -407,13 +439,7 @@ fn make_grep_styles(opt: &cli::Opt, styles: &mut HashMap<&str, StyleReference>) 
         (
             "grep-match-word-style",
             if let Some(s) = &opt.grep_match_word_style {
-                style_from_str(
-                    s,
-                    None,
-                    None,
-                    opt.computed.true_color,
-                    opt.git_config.as_ref(),
-                )
+                style_from_str(s, None, None, opt.computed.true_color, opt.git_config())
             } else {
                 StyleReference::Reference("plus-emph-style".to_owned())
             },
@@ -421,44 +447,30 @@ fn make_grep_styles(opt: &cli::Opt, styles: &mut HashMap<&str, StyleReference>) 
         (
             "grep-context-line-style",
             if let Some(s) = &opt.grep_context_line_style {
-                style_from_str(
-                    s,
-                    None,
-                    None,
-                    opt.computed.true_color,
-                    opt.git_config.as_ref(),
-                )
+                style_from_str(s, None, None, opt.computed.true_color, opt.git_config())
             } else {
                 StyleReference::Reference("zero-style".to_owned())
             },
         ),
         (
             "grep-file-style",
-            if let Some(s) = &opt.grep_file_style {
-                style_from_str(
-                    s,
-                    None,
-                    None,
-                    opt.computed.true_color,
-                    opt.git_config.as_ref(),
-                )
-            } else {
-                StyleReference::Reference("hunk-header-file-style".to_owned())
-            },
+            style_from_str(
+                &opt.grep_file_style,
+                None,
+                None,
+                opt.computed.true_color,
+                opt.git_config(),
+            ),
         ),
         (
             "grep-line-number-style",
-            if let Some(s) = &opt.grep_line_number_style {
-                style_from_str(
-                    s,
-                    None,
-                    None,
-                    opt.computed.true_color,
-                    opt.git_config.as_ref(),
-                )
-            } else {
-                StyleReference::Reference("hunk-header-line-number-style".to_owned())
-            },
+            style_from_str(
+                &opt.grep_line_number_style,
+                None,
+                None,
+                opt.computed.true_color,
+                opt.git_config(),
+            ),
         ),
     ])
 }
@@ -471,7 +483,7 @@ fn make_merge_conflict_styles(opt: &cli::Opt, styles: &mut HashMap<&str, StyleRe
             None,
             Some(&opt.merge_conflict_ours_diff_header_decoration_style),
             opt.computed.true_color,
-            opt.git_config.as_ref(),
+            opt.git_config(),
         ),
     );
     styles.insert(
@@ -481,7 +493,7 @@ fn make_merge_conflict_styles(opt: &cli::Opt, styles: &mut HashMap<&str, StyleRe
             None,
             Some(&opt.merge_conflict_theirs_diff_header_decoration_style),
             opt.computed.true_color,
-            opt.git_config.as_ref(),
+            opt.git_config(),
         ),
     );
 }
@@ -494,22 +506,32 @@ fn make_misc_styles(opt: &cli::Opt, styles: &mut HashMap<&str, StyleReference>) 
             None,
             None,
             opt.computed.true_color,
-            opt.git_config.as_ref(),
+            opt.git_config(),
         ),
     );
     styles.insert(
         "git-minus-style",
-        StyleReference::Style(match opt.git_config_entries.get("color.diff.old") {
-            Some(GitConfigEntry::Style(s)) => Style::from_git_str(s),
-            _ => *style::GIT_DEFAULT_MINUS_STYLE,
-        }),
+        StyleReference::Style(
+            match opt
+                .git_config()
+                .and_then(|cfg| cfg.get::<String>("color.diff.old"))
+            {
+                Some(s) => Style::from_git_str(&s),
+                None => *style::GIT_DEFAULT_MINUS_STYLE,
+            },
+        ),
     );
     styles.insert(
         "git-plus-style",
-        StyleReference::Style(match opt.git_config_entries.get("color.diff.new") {
-            Some(GitConfigEntry::Style(s)) => Style::from_git_str(s),
-            _ => *style::GIT_DEFAULT_PLUS_STYLE,
-        }),
+        StyleReference::Style(
+            match opt
+                .git_config()
+                .and_then(|cfg| cfg.get::<String>("color.diff.new"))
+            {
+                Some(s) => Style::from_git_str(&s),
+                None => *style::GIT_DEFAULT_PLUS_STYLE,
+            },
+        ),
     );
 }
 
@@ -552,28 +574,6 @@ fn style_from_str_with_handling_of_special_decoration_attributes(
                 git_config,
             ),
         )
-    }
-}
-
-fn style_from_str_with_handling_of_special_decoration_attributes_and_respecting_deprecated_foreground_color_arg(
-    style_string: &str,
-    default: Option<Style>,
-    decoration_style_string: Option<&str>,
-    deprecated_foreground_color_arg: Option<&str>,
-    true_color: bool,
-    git_config: Option<&GitConfig>,
-) -> StyleReference {
-    if is_style_reference(style_string) {
-        StyleReference::Reference(style_string.to_owned())
-    } else {
-        StyleReference::Style(Style::from_str_with_handling_of_special_decoration_attributes_and_respecting_deprecated_foreground_color_arg(
-            style_string,
-            default,
-            decoration_style_string,
-            deprecated_foreground_color_arg,
-            true_color,
-            git_config,
-        ))
     }
 }
 

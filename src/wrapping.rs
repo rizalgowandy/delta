@@ -1,7 +1,10 @@
 use syntect::highlighting::Style as SyntectStyle;
 use unicode_segmentation::UnicodeSegmentation;
+use unicode_width::UnicodeWidthStr;
 
+use crate::cli;
 use crate::config::INLINE_SYMBOL_WIDTH_1;
+use crate::fatal;
 
 use crate::config::Config;
 use crate::delta::DiffType;
@@ -11,6 +14,7 @@ use crate::features::side_by_side::{available_line_width, line_is_too_long, Left
 use crate::minusplus::*;
 use crate::paint::LineSections;
 use crate::style::Style;
+use crate::utils::syntect::FromDeltaStyle;
 
 /// See [`wrap_line`] for documentation.
 #[derive(Clone, Debug)]
@@ -25,6 +29,91 @@ pub struct WrapConfig {
     // adapt_wrap_max_lines_argument()
     pub max_lines: usize,
     pub inline_hint_syntect_style: SyntectStyle,
+}
+
+impl WrapConfig {
+    pub fn from_opt(opt: &cli::Opt, inline_hint_style: Style) -> Self {
+        Self {
+            left_symbol: ensure_display_width_1("wrap-left-symbol", opt.wrap_left_symbol.clone()),
+            right_symbol: ensure_display_width_1(
+                "wrap-right-symbol",
+                opt.wrap_right_symbol.clone(),
+            ),
+            right_prefix_symbol: ensure_display_width_1(
+                "wrap-right-prefix-symbol",
+                opt.wrap_right_prefix_symbol.clone(),
+            ),
+            use_wrap_right_permille: {
+                let arg = &opt.wrap_right_percent;
+                let percent = remove_percent_suffix(arg)
+                    .parse::<f64>()
+                    .unwrap_or_else(|err| {
+                        fatal(format!(
+                            "Could not parse wrap-right-percent argument {}: {}.",
+                            &arg, err
+                        ))
+                    });
+                if percent.is_finite() && percent > 0.0 && percent < 100.0 {
+                    (percent * 10.0).round() as usize
+                } else {
+                    fatal("Invalid value for wrap-right-percent, not between 0 and 100.")
+                }
+            },
+            max_lines: adapt_wrap_max_lines_argument(opt.wrap_max_lines.clone()),
+            inline_hint_syntect_style: SyntectStyle::from_delta_style(inline_hint_style),
+        }
+    }
+
+    // Compute value of `max_line_length` field in the main `Config` struct.
+    pub fn config_max_line_length(
+        &self,
+        max_line_length: usize,
+        available_terminal_width: usize,
+    ) -> usize {
+        match self.max_lines {
+            1 => max_line_length,
+            // Ensure there is enough text to wrap, either don't truncate the input at all (0)
+            // or ensure there is enough for the requested number of lines.
+            // The input can contain ANSI sequences, so round up a bit. This is enough for
+            // normal `git diff`, but might not be with ANSI heavy input.
+            0 => 0,
+            wrap_max_lines => {
+                let single_pane_width = available_terminal_width / 2;
+                let add_25_percent_or_term_width =
+                    |x| x + std::cmp::max((x * 250) / 1000, single_pane_width);
+                std::cmp::max(
+                    max_line_length,
+                    add_25_percent_or_term_width(single_pane_width * wrap_max_lines),
+                )
+            }
+        }
+    }
+}
+
+fn remove_percent_suffix(arg: &str) -> &str {
+    match &arg.strip_suffix('%') {
+        Some(s) => s,
+        None => arg,
+    }
+}
+
+fn ensure_display_width_1(what: &str, arg: String) -> String {
+    match arg.grapheme_indices(true).count() {
+        INLINE_SYMBOL_WIDTH_1 => arg,
+        width => fatal(format!(
+            "Invalid value for {what}, display width of \"{arg}\" must be {INLINE_SYMBOL_WIDTH_1} but is {width}",
+        )),
+    }
+}
+
+fn adapt_wrap_max_lines_argument(arg: String) -> usize {
+    if arg == "∞" || arg == "unlimited" || arg.starts_with("inf") {
+        0
+    } else {
+        arg.parse::<usize>()
+            .unwrap_or_else(|err| fatal(format!("Invalid wrap-max-lines argument: {err}")))
+            + 1
+    }
 }
 
 #[derive(PartialEq)]
@@ -113,11 +202,21 @@ where
 
         let (style, text, graphemes) = stack
             .pop()
-            .map(|(style, text)| (style, text, text.grapheme_indices(true).collect::<Vec<_>>()))
+            .map(|(style, text)| {
+                (
+                    style,
+                    text,
+                    text.graphemes(true)
+                        .map(|item| (item.len(), item.width()))
+                        .collect::<Vec<_>>(),
+                )
+            })
             .unwrap();
 
-        let new_len = curr_line.len + graphemes.len();
+        let graphemes_width: usize = graphemes.iter().map(|(_, w)| w).sum();
+        let new_len = curr_line.len + graphemes_width;
 
+        #[allow(clippy::comparison_chain)]
         let must_split = if new_len < line_width {
             curr_line.push_and_set_len((style, text), new_len);
             false
@@ -139,15 +238,6 @@ where
                 }
                 _ => true,
             }
-        } else if new_len == line_width + 1 && stack.is_empty() {
-            // If the one overhanging char is '\n' then keep it on the current line.
-            if text.ends_with('\n') {
-                // Do not count the included '\n': - 1
-                curr_line.push_and_set_len((style, text), new_len - 1);
-                false
-            } else {
-                true
-            }
         } else {
             true
         };
@@ -155,16 +245,29 @@ where
         // Text must be split, one part (or just `wrap_symbol`) is added to the
         // current line, the other is pushed onto the stack.
         if must_split {
-            let grapheme_split_pos = graphemes.len() - (new_len - line_width) - 1;
+            let mut width_left = graphemes_width
+                .saturating_sub(new_len - line_width)
+                .saturating_sub(wrap_config.left_symbol.width());
 
             // The length does not matter anymore and `curr_line` will be reset
             // at the end, so move the line segments out.
             let mut line_segments = curr_line.line_segments;
 
-            let next_line = if grapheme_split_pos == 0 {
+            let next_line = if width_left == 0 {
                 text
             } else {
-                let byte_split_pos = graphemes[grapheme_split_pos].0;
+                let mut byte_split_pos = 0;
+                // After loop byte_split_pos may still equal to 0. If width_left
+                // is less than the width of first character, We can't display it.
+                for &(item_len, item_width) in graphemes.iter() {
+                    if width_left >= item_width {
+                        byte_split_pos += item_len;
+                        width_left -= item_width;
+                    } else {
+                        break;
+                    }
+                }
+
                 let this_line = &text[..byte_split_pos];
                 line_segments.push((style, this_line));
                 &text[byte_split_pos..]
@@ -184,7 +287,9 @@ where
     if result.len() == 1 && curr_line.has_text() {
         let current_permille = (curr_line.text_len() * 1000) / line_width;
 
-        let pad_len = line_width.saturating_sub(curr_line.text_len());
+        // pad line will add a wrap_config.right_prefix_symbol
+        let pad_len = line_width
+            .saturating_sub(curr_line.text_len() + wrap_config.right_prefix_symbol.width());
 
         if wrap_config.use_wrap_right_permille > current_permille && pad_len > 0 {
             // The inserted spaces, which align a line to the right, point into this string.
@@ -364,8 +469,7 @@ pub fn wrap_minusplus_block<'c: 'a, 'a>(
         assert_eq!(
             (start, extended_to),
             (start2, extended_to2),
-            "syntax and diff wrapping differs {}",
-            errhint
+            "syntax and diff wrapping differs {errhint}",
         );
 
         (start, extended_to)
@@ -696,7 +800,7 @@ mod tests {
         let lines = wrap_test(&cfg, line, 11);
         assert_eq!(lines.len(), 2);
         assert_eq!(lines[0].last().unwrap().1, WR);
-        assert_eq!(lines[1], [(*SD, "         "), (*SD, ">"), (*S1, "ab")]);
+        assert_eq!(lines[1], [(*SD, "        "), (*SD, ">"), (*S1, "ab")]);
     }
 
     #[test]
@@ -712,7 +816,7 @@ mod tests {
                 lines,
                 vec![
                     vec![(*S1, "012"), (*S2, "34"), (*SD, WR)],
-                    vec![(*SD, "    "), (*SD, RA), (*S2, "56")]
+                    vec![(*SD, "   "), (*SD, RA), (*S2, "56")]
                 ]
             );
         }
@@ -739,7 +843,7 @@ mod tests {
             let s1s2 = v.iter().cycle();
             let text: Vec<_> = IN.matches(|_| true).take(len + 1).collect();
             s1s2.zip(text.iter())
-                .map(|(style, text)| (style.clone(), *text))
+                .map(|(style, text)| (*style, *text))
                 .collect()
         }
         fn mk_input_nl(len: usize) -> LineSections<'static, Style> {
@@ -754,7 +858,7 @@ mod tests {
             to: usize,
             append: Option<(Style, &'a str)>,
         ) -> LineSections<'a, Style> {
-            let mut result: Vec<_> = vec[from..to].iter().cloned().collect();
+            let mut result: Vec<_> = vec[from..to].to_vec();
             if let Some(val) = append {
                 result.push(val);
             }
@@ -851,13 +955,19 @@ mod tests {
         );
 
         // Not working: Tailored grapheme clusters: क्षि  = क् + षि
-        let line = vec![(*S1, "abc"), (*S2, "deநி"), (*S1, "ghij")];
+        //
+        // Difference compare to previous example (even they may look like the
+        // same width in text editor.) :
+        //
+        // width நி: 2
+        // width ö̲: 1
+        let line = vec![(*S1, "abc"), (*S2, "dநி"), (*S1, "ghij")];
         let lines = wrap_test(&cfg, line, 4);
         assert_eq!(
             lines,
             vec![
                 vec![(*S1, "abc"), (*SD, W)],
-                vec![(*S2, "deநி"), (*SD, W)],
+                vec![(*S2, "dநி"), (*SD, W)],
                 vec![(*S1, "ghij")]
             ]
         );
@@ -966,12 +1076,12 @@ index 223ca50..e69de29 100644
         .with_input(HUNK_MP_DIFF)
         .expect_after_header(
             r#"
-            │ 4  │ abcdefghijklmn+ │ 15 │ abcdefghijklmn+
+            │  4 │ abcdefghijklmn+ │ 15 │ abcdefghijklmn+
             │    │ opqrstuvwxzy 0+ │    │ opqrstuvwxzy 0+
             │    │ 123456789 0123+ │    │ 123456789 0123+
             │    │ 456789 0123456+ │    │ 456789 0123456+
             │    │ 789 0123456789> │    │ 789 0123456789>
-            │ 5  │-a = 0123456789+ │ 16 │+b = 0123456789+
+            │  5 │-a = 0123456789+ │ 16 │+b = 0123456789+
             │    │  0123456789 01+ │    │  0123456789 01+
             │    │ 23456789 01234+ │    │ 23456789 01234+
             │    │ 56789 01234567+ │    │ 56789 01234567+
@@ -994,12 +1104,11 @@ index 223ca50..e69de29 100644
         {
             DeltaTest::with_config(&config)
                 .with_input(&format!(
-                    "{}-{}+{}",
-                    HUNK_ALIGN_DIFF_HEADER, HUNK_ALIGN_DIFF_SHORT, HUNK_ALIGN_DIFF_LONG
+                    "{HUNK_ALIGN_DIFF_HEADER}-{HUNK_ALIGN_DIFF_SHORT}+{HUNK_ALIGN_DIFF_LONG}",
                 ))
                 .expect_after_header(
                     r#"
-                    │ 1  │.........1.........2< │ 1  │.........1.........2+
+                    │  1 │.........1.........2< │  1 │.........1.........2+
                     │    │                >.... │    │.........3.........4+
                     │    │                      │    │.........5.........6"#,
                 );
@@ -1009,12 +1118,11 @@ index 223ca50..e69de29 100644
         {
             DeltaTest::with_config(&config)
                 .with_input(&format!(
-                    "{}-{}+{}",
-                    HUNK_ALIGN_DIFF_HEADER, HUNK_ALIGN_DIFF_LONG, HUNK_ALIGN_DIFF_SHORT
+                    "{HUNK_ALIGN_DIFF_HEADER}-{HUNK_ALIGN_DIFF_LONG}+{HUNK_ALIGN_DIFF_SHORT}",
                 ))
                 .expect_after_header(
                     r#"
-                    │ 1  │.........1.........2+ │ 1  │.........1.........2<
+                    │  1 │.........1.........2+ │  1 │.........1.........2<
                     │    │.........3.........4+ │    │                >....
                     │    │.........5.........6  │    │"#,
                 );
@@ -1034,12 +1142,11 @@ index 223ca50..e69de29 100644
         {
             DeltaTest::with_config(&config)
                 .with_input(&format!(
-                    "{}-{}+{}",
-                    HUNK_ALIGN_DIFF_HEADER, HUNK_ALIGN_DIFF_SHORT, HUNK_ALIGN_DIFF_LONG
+                    "{HUNK_ALIGN_DIFF_HEADER}-{HUNK_ALIGN_DIFF_SHORT}+{HUNK_ALIGN_DIFF_LONG}",
                 ))
                 .expect_after_header(
                     r#"
-                    │ 1  │.........1.........2....│ 1  │.........1.........2...+
+                    │  1 │.........1.........2....│  1 │.........1.........2...+
                     │    │                        │    │......3.........4......+
                     │    │                        │    │...5.........6          "#,
                 );
@@ -1048,12 +1155,11 @@ index 223ca50..e69de29 100644
         {
             DeltaTest::with_config(&config)
                 .with_input(&format!(
-                    "{}-{}+{}",
-                    HUNK_ALIGN_DIFF_HEADER, HUNK_ALIGN_DIFF_LONG, HUNK_ALIGN_DIFF_SHORT
+                    "{HUNK_ALIGN_DIFF_HEADER}-{HUNK_ALIGN_DIFF_LONG}+{HUNK_ALIGN_DIFF_SHORT}",
                 ))
                 .expect_after_header(
                     r#"
-                    │ 1  │.........1.........2...+│ 1  │.........1.........2....
+                    │  1 │.........1.........2...+│  1 │.........1.........2....
                     │    │......3.........4......+│    │
                     │    │...5.........6          │    │"#,
                 );
@@ -1077,12 +1183,11 @@ index 223ca50..e69de29 100644
         {
             DeltaTest::with_config(&config)
                 .with_input(&format!(
-                    "{}-{}+{}",
-                    HUNK_ALIGN_DIFF_HEADER, HUNK_ALIGN_DIFF_SHORT, HUNK_ALIGN_DIFF_LONG
+                    "{HUNK_ALIGN_DIFF_HEADER}-{HUNK_ALIGN_DIFF_SHORT}+{HUNK_ALIGN_DIFF_LONG}",
                 ))
                 .expect_after_header(
                     r#"
-                    │ 1  │.........1.........2....      │ 1  │.........1.........2.........+
+                    │  1 │.........1.........2....      │  1 │.........1.........2.........+
                     │    │                              │    │3.........4.........5........+
                     │    │                              │    │.6                            "#,
                 );
@@ -1092,12 +1197,11 @@ index 223ca50..e69de29 100644
             config.wrap_config.max_lines = 2;
             DeltaTest::with_config(&config)
                 .with_input(&format!(
-                    "{}-{}+{}",
-                    HUNK_ALIGN_DIFF_HEADER, HUNK_ALIGN_DIFF_SHORT, HUNK_ALIGN_DIFF_LONG
+                    "{HUNK_ALIGN_DIFF_HEADER}-{HUNK_ALIGN_DIFF_SHORT}+{HUNK_ALIGN_DIFF_LONG}",
                 ))
                 .expect_after_header(
                     r#"
-                    │ 1  │.........1.........2....      │ 1  │.........1.........2.........+
+                    │  1 │.........1.........2....      │  1 │.........1.........2.........+
                     │    │                              │    │3.........4.........5........>"#,
                 );
         }

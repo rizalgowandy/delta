@@ -1,14 +1,14 @@
 use std::cmp::max;
 use std::collections::VecDeque;
 
-const SUBSTITUTION_COST: usize = 1;
-const DELETION_COST: usize = 1;
-const INSERTION_COST: usize = 1;
+const DELETION_COST: usize = 2;
+const INSERTION_COST: usize = 2;
+// extra cost for starting a new group of changed tokens
+const INITIAL_MISMATCH_PENALTY: usize = 1;
 
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Operation {
     NoOp,
-    Substitution,
     Deletion,
     Insertion,
 }
@@ -61,14 +61,14 @@ impl<'a> Alignment<'a> {
             self.table[i] = Cell {
                 parent: 0,
                 operation: Deletion,
-                cost: i,
+                cost: i * DELETION_COST + INITIAL_MISMATCH_PENALTY,
             };
         }
         for j in 1..self.dim[0] {
             self.table[j * self.dim[1]] = Cell {
                 parent: 0,
                 operation: Insertion,
-                cost: j,
+                cost: j * INSERTION_COST + INITIAL_MISMATCH_PENALTY,
             };
         }
 
@@ -76,22 +76,32 @@ impl<'a> Alignment<'a> {
             for (j, y_j) in self.y.iter().enumerate() {
                 let (left, diag, up) =
                     (self.index(i, j + 1), self.index(i, j), self.index(i + 1, j));
+                // The order of the candidates matters if two of them have the
+                // same cost as in that case we choose the first one. Consider
+                // insertions and deletions before matches in order to group
+                // changes together. Insertions are preferred to deletions in
+                // order to highlight moved tokens as a deletion followed by an
+                // insertion (as the edit sequence is read backwards we need to
+                // choose the insertion first)
                 let candidates = [
-                    Cell {
-                        parent: left,
-                        operation: Deletion,
-                        cost: self.table[left].cost + DELETION_COST,
-                    },
-                    Cell {
-                        parent: diag,
-                        operation: if x_i == y_j { NoOp } else { Substitution },
-                        cost: self.table[diag].cost
-                            + if x_i == y_j { 0 } else { SUBSTITUTION_COST },
-                    },
                     Cell {
                         parent: up,
                         operation: Insertion,
-                        cost: self.table[up].cost + INSERTION_COST,
+                        cost: self.mismatch_cost(up, INSERTION_COST),
+                    },
+                    Cell {
+                        parent: left,
+                        operation: Deletion,
+                        cost: self.mismatch_cost(left, DELETION_COST),
+                    },
+                    Cell {
+                        parent: diag,
+                        operation: NoOp,
+                        cost: if x_i == y_j {
+                            self.table[diag].cost
+                        } else {
+                            usize::MAX
+                        },
                     },
                 ];
                 let index = self.index(i + 1, j + 1);
@@ -102,6 +112,16 @@ impl<'a> Alignment<'a> {
                     .clone();
             }
         }
+    }
+
+    fn mismatch_cost(&self, parent: usize, basic_cost: usize) -> usize {
+        self.table[parent].cost
+            + basic_cost
+            + if self.table[parent].operation == NoOp {
+                INITIAL_MISMATCH_PENALTY
+            } else {
+                0
+            }
     }
 
     /// Read edit operations from the table.
@@ -122,74 +142,9 @@ impl<'a> Alignment<'a> {
         run_length_encode(self.operations())
     }
 
-    /// Compute custom distance metric from the filled table. The distance metric is
-    ///
-    /// (total length of edits) / (total length of longer string)
-    ///
-    /// where length is measured in number of unicode grapheme clusters.
-    #[allow(dead_code)]
-    pub fn distance(&self) -> f64 {
-        let (numer, denom) = self.distance_parts();
-        (numer as f64) / (denom as f64)
-    }
-
-    #[allow(dead_code)]
-    pub fn distance_parts(&self) -> (usize, usize) {
-        let (mut numer, mut denom) = (0, 0);
-        for op in self.operations() {
-            if op != NoOp {
-                numer += 1;
-            }
-            denom += 1;
-        }
-        (numer, denom)
-    }
-
-    /// Compute levenshtein distance from the filled table.
-    #[allow(dead_code)]
-    pub fn levenshtein_distance(&self) -> usize {
-        self.table[self.index(self.x.len(), self.y.len())].cost
-    }
-
     // Row-major storage of 2D array.
     fn index(&self, i: usize, j: usize) -> usize {
         j * self.dim[1] + i
-    }
-
-    #[allow(dead_code)]
-    fn format_cell(&self, cell: &Cell) -> String {
-        let parent = &self.table[cell.parent];
-        let op = match cell.operation {
-            Deletion => "-",
-            Substitution => "*",
-            Insertion => "+",
-            NoOp => ".",
-        };
-        format!("{}{}{}", parent.cost, op, cell.cost)
-    }
-
-    #[allow(dead_code)]
-    fn print(&self) {
-        println!("x: {:?}", self.x);
-        println!("y: {:?}", self.y);
-        println!();
-        print!("      ");
-        for j in 0..self.dim[1] {
-            print!("{}     ", if j > 0 { self.x[j - 1] } else { " " })
-        }
-        println!();
-
-        for i in 0..self.dim[0] {
-            for j in 0..self.dim[1] {
-                if j == 0 {
-                    print!("{}     ", if i > 0 { self.y[i - 1] } else { " " })
-                }
-                let cell = &self.table[self.index(j, i)];
-                print!("{}   ", self.format_cell(cell));
-            }
-            println!();
-        }
-        println!();
     }
 }
 
@@ -240,68 +195,176 @@ mod tests {
 
     #[test]
     fn test_0() {
-        let (before, after) = ("aaa", "aba");
-        assert_string_distance_parts(before, after, (1, 3));
-        assert_eq!(operations(before, after), vec![NoOp, Substitution, NoOp,]);
+        TestCase {
+            before: "aaa",
+            after: "aba",
+            distance: 5,
+            parts: (2, 4),
+            operations: vec![NoOp, Deletion, Insertion, NoOp],
+        }
+        .run();
     }
 
     #[test]
     fn test_0_nonascii() {
-        let (before, after) = ("ááb", "áaa");
-        assert_string_distance_parts(before, after, (2, 3));
-        assert_eq!(
-            operations(before, after),
-            vec![NoOp, Substitution, Substitution,]
-        );
+        TestCase {
+            before: "ááb",
+            after: "áaa",
+            distance: 9,
+            parts: (4, 5),
+            operations: vec![NoOp, Deletion, Deletion, Insertion, Insertion],
+        }
+        .run();
     }
 
     #[test]
     fn test_1() {
-        let (before, after) = ("kitten", "sitting");
-        assert_string_distance_parts(before, after, (3, 7));
-        assert_eq!(
-            operations(before, after),
-            vec![
-                Substitution, // K S
-                NoOp,         // I I
-                NoOp,         // T T
-                NoOp,         // T T
-                Substitution, // E I
-                NoOp,         // N N
-                Insertion     // - G
-            ]
-        );
+        TestCase {
+            before: "kitten",
+            after: "sitting",
+            distance: 13,
+            parts: (5, 9),
+            operations: vec![
+                Deletion,  // K -
+                Insertion, // - S
+                NoOp,      // I I
+                NoOp,      // T T
+                NoOp,      // T T
+                Deletion,  // E -
+                Insertion, // - I
+                NoOp,      // N N
+                Insertion, // - G
+            ],
+        }
+        .run();
     }
 
     #[test]
     fn test_2() {
-        let (before, after) = ("saturday", "sunday");
-        assert_string_distance_parts(before, after, (3, 8));
-        assert_eq!(
-            operations(before, after),
-            vec![
-                NoOp,         // S S
-                Deletion,     // A -
-                Deletion,     // T -
-                NoOp,         // U U
-                Substitution, // R N
-                NoOp,         // D D
-                NoOp,         // A A
-                NoOp          // Y Y
-            ]
-        );
+        TestCase {
+            before: "saturday",
+            after: "sunday",
+            distance: 10,
+            parts: (4, 9),
+            operations: vec![
+                NoOp,      // S S
+                Deletion,  // A -
+                Deletion,  // T -
+                NoOp,      // U U
+                Deletion,  // R -
+                Insertion, // - N
+                NoOp,      // D D
+                NoOp,      // A A
+                NoOp,      // Y Y
+            ],
+        }
+        .run();
     }
 
-    fn assert_string_distance_parts(s1: &str, s2: &str, parts: (usize, usize)) {
-        let (numer, _) = parts;
-        assert_string_levenshtein_distance(s1, s2, numer);
-        assert_eq!(string_distance_parts(s1, s2), parts);
-        assert_eq!(string_distance_parts(s2, s1), parts);
+    #[test]
+    fn test_3() {
+        TestCase {
+            // Prefer [Deletion NoOp Insertion] over [Insertion NoOp Deletion]
+            before: "ab",
+            after: "ba",
+            distance: 6,
+            parts: (2, 3),
+            operations: vec![
+                Deletion,  // a -
+                NoOp,      // b b
+                Insertion, // - a
+            ],
+        }
+        .run();
     }
 
-    fn assert_string_levenshtein_distance(s1: &str, s2: &str, d: usize) {
-        assert_eq!(string_levenshtein_distance(s1, s2), d);
-        assert_eq!(string_levenshtein_distance(s2, s1), d);
+    #[test]
+    fn test_4() {
+        // Deletions are grouped together.
+        TestCase {
+            before: "AABB",
+            after: "AB",
+            distance: 5,
+            parts: (2, 4),
+            operations: vec![
+                NoOp,     // A A
+                Deletion, // A -
+                Deletion, // B -
+                NoOp,     // B B
+            ],
+        }
+        .run();
+    }
+
+    #[test]
+    fn test_5() {
+        // Insertions are grouped together.
+        TestCase {
+            before: "AB",
+            after: "AABB",
+            distance: 5,
+            parts: (2, 4),
+            operations: vec![
+                NoOp,      // A A
+                Insertion, // - A
+                Insertion, // - B
+                NoOp,      // B B
+            ],
+        }
+        .run();
+    }
+
+    #[test]
+    fn test_6() {
+        // Insertion and Deletion are grouped together.
+        TestCase {
+            before: "AAABBB",
+            after: "ACB",
+            distance: 11,
+            parts: (5, 7),
+            operations: vec![
+                NoOp,      // A A
+                Deletion,  // A -
+                Deletion,  // A -
+                Deletion,  // B -
+                Deletion,  // B -
+                Insertion, // - C
+                NoOp,      // B B
+            ],
+        }
+        .run();
+    }
+
+    struct TestCase<'a> {
+        before: &'a str,
+        after: &'a str,
+        distance: usize,
+        parts: (usize, usize),
+        operations: Vec<Operation>,
+    }
+
+    impl<'a> TestCase<'a> {
+        pub fn run(&self) {
+            self.assert_string_distance_parts();
+            assert_eq!(operations(self.before, self.after), self.operations);
+        }
+
+        fn assert_string_distance_parts(&self) {
+            self.assert_string_levenshtein_distance();
+            assert_eq!(string_distance_parts(self.before, self.after), self.parts);
+            assert_eq!(string_distance_parts(self.after, self.before), self.parts);
+        }
+
+        fn assert_string_levenshtein_distance(&self) {
+            assert_eq!(
+                string_levenshtein_distance(self.before, self.after),
+                self.distance
+            );
+            assert_eq!(
+                string_levenshtein_distance(self.after, self.before),
+                self.distance
+            );
+        }
     }
 
     fn string_distance_parts(x: &str, y: &str) -> (usize, usize) {
@@ -326,5 +389,58 @@ mod tests {
             y.graphemes(true).collect::<Vec<&str>>(),
         );
         Alignment::new(x, y).operations()
+    }
+
+    impl<'a> Alignment<'a> {
+        pub fn distance_parts(&self) -> (usize, usize) {
+            let (mut numer, mut denom) = (0, 0);
+            for op in self.operations() {
+                if op != NoOp {
+                    numer += 1;
+                }
+                denom += 1;
+            }
+            (numer, denom)
+        }
+
+        /// Compute levenshtein distance from the filled table.
+        pub fn levenshtein_distance(&self) -> usize {
+            self.table[self.index(self.x.len(), self.y.len())].cost
+        }
+
+        #[allow(dead_code)]
+        fn format_cell(&self, cell: &Cell) -> String {
+            let parent = &self.table[cell.parent];
+            let op = match cell.operation {
+                Deletion => "-",
+                Insertion => "+",
+                NoOp => ".",
+            };
+            format!("{}{}{}", parent.cost, op, cell.cost)
+        }
+
+        #[allow(dead_code)]
+        fn print(&self) {
+            println!("x: {:?}", self.x);
+            println!("y: {:?}", self.y);
+            println!();
+            print!("      ");
+            for j in 0..self.dim[1] {
+                print!("{}     ", if j > 0 { self.x[j - 1] } else { " " })
+            }
+            println!();
+
+            for i in 0..self.dim[0] {
+                for j in 0..self.dim[1] {
+                    if j == 0 {
+                        print!("{}     ", if i > 0 { self.y[i - 1] } else { " " })
+                    }
+                    let cell = &self.table[self.index(j, i)];
+                    print!("{}   ", self.format_cell(cell));
+                }
+                println!();
+            }
+            println!();
+        }
     }
 }

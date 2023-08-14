@@ -26,12 +26,14 @@ pub fn show_config(config: &config::Config, writer: &mut dyn Write) -> std::io::
     plus-non-emph-style           = {plus_non_emph_style}
     plus-emph-style               = {plus_emph_style}
     plus-empty-line-marker-style  = {plus_empty_line_marker_style}
+    grep-file-style               = {grep_file_style}
+    grep-line-number-style        = {grep_line_number_style}
     whitespace-error-style        = {whitespace_error_style}
     blame-palette                 = {blame_palette}",
         blame_palette = config
             .blame_palette
             .iter()
-            .map(|s| style::paint_color_string(s, config.true_color, config.git_config.as_ref()))
+            .map(|s| style::paint_color_string(s, config.true_color, config.git_config()))
             .join(" "),
         commit_style = config.commit_style.to_painted_string(),
         file_style = config.file_style.to_painted_string(),
@@ -44,6 +46,8 @@ pub fn show_config(config: &config::Config, writer: &mut dyn Write) -> std::io::
         plus_empty_line_marker_style = config.plus_empty_line_marker_style.to_painted_string(),
         plus_non_emph_style = config.plus_non_emph_style.to_painted_string(),
         plus_style = config.plus_style.to_painted_string(),
+        grep_file_style = config.grep_file_style.to_painted_string(),
+        grep_line_number_style = config.grep_line_number_style.to_painted_string(),
         whitespace_error_style = config.whitespace_error_style.to_painted_string(),
         zero_style = config.zero_style.to_painted_string(),
     )?;
@@ -136,7 +140,7 @@ pub fn show_config(config: &config::Config, writer: &mut dyn Write) -> std::io::
         navigate = config.navigate,
         navigate_regex = match &config.navigate_regex {
             None => "".to_string(),
-            Some(s) => format_option_value(s.to_string()),
+            Some(s) => format_option_value(s),
         },
         pager = config.pager.clone().unwrap_or_else(|| "none".to_string()),
         paging_mode = match config.paging_mode {
@@ -154,8 +158,8 @@ pub fn show_config(config: &config::Config, writer: &mut dyn Write) -> std::io::
             cli::Width::Fixed(width) => width.to_string(),
             cli::Width::Variable => "variable".to_string(),
         },
-        tab_width = config.tab_width,
-        tokenization_regex = format_option_value(&config.tokenization_regex.to_string()),
+        tab_width = config.tab_cfg.width(),
+        tokenization_regex = format_option_value(config.tokenization_regex.to_string()),
     )?;
     Ok(())
 }
@@ -172,7 +176,7 @@ where
         || s.contains(&['\\', '{', '}', ':'][..])
         || s.is_empty()
     {
-        format!("'{}'", s)
+        format!("'{s}'")
     } else {
         s.to_string()
     }
@@ -184,7 +188,7 @@ mod tests {
 
     use super::*;
     use crate::ansi;
-    use std::io::{Cursor, Read, Seek, SeekFrom};
+    use std::io::{Cursor, Read, Seek};
 
     #[test]
     fn test_show_config() {
@@ -192,7 +196,7 @@ mod tests {
         let mut writer = Cursor::new(vec![0; 1024]);
         show_config(&config, &mut writer).unwrap();
         let mut s = String::new();
-        writer.seek(SeekFrom::Start(0)).unwrap();
+        writer.rewind().unwrap();
         writer.read_to_string(&mut s).unwrap();
         let s = ansi::strip_ansi_codes(&s);
         assert!(s.contains("    commit-style                  = raw\n"));

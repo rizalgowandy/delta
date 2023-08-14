@@ -24,6 +24,7 @@ pub struct AnsiElementIterator<'a> {
     pos: usize,
 }
 
+#[derive(Default)]
 struct Performer {
     // Becomes non-None when the parser finishes parsing an ANSI sequence.
     // This is never Element::Text.
@@ -35,10 +36,26 @@ struct Performer {
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum Element {
-    Csi(ansi_term::Style, usize, usize),
+    Sgr(ansi_term::Style, usize, usize),
+    Csi(usize, usize),
     Esc(usize, usize),
     Osc(usize, usize),
     Text(usize, usize),
+}
+
+impl Element {
+    fn set_range(&mut self, start: usize, end: usize) {
+        let (from, to) = match self {
+            Element::Sgr(_, from, to) => (from, to),
+            Element::Csi(from, to) => (from, to),
+            Element::Esc(from, to) => (from, to),
+            Element::Osc(from, to) => (from, to),
+            Element::Text(from, to) => (from, to),
+        };
+
+        *from = start;
+        *to = end;
+    }
 }
 
 impl<'a> AnsiElementIterator<'a> {
@@ -53,16 +70,12 @@ impl<'a> AnsiElementIterator<'a> {
         }
     }
 
-    #[allow(dead_code)]
-    pub fn dbg(s: &str) {
-        for el in AnsiElementIterator::new(s) {
-            match el {
-                Element::Csi(_, i, j) => println!("CSI({}, {}, {:?})", i, j, &s[i..j]),
-                Element::Esc(i, j) => println!("ESC({}, {}, {:?})", i, j, &s[i..j]),
-                Element::Osc(i, j) => println!("OSC({}, {}, {:?})", i, j, &s[i..j]),
-                Element::Text(i, j) => println!("Text({}, {}, {:?})", i, j, &s[i..j]),
-            }
-        }
+    fn advance_vte(&mut self, byte: u8) {
+        let mut performer = Performer::default();
+        self.machine.advance(&mut performer, byte);
+        self.element = performer.element;
+        self.text_length += performer.text_length;
+        self.pos += 1;
     }
 }
 
@@ -70,52 +83,39 @@ impl<'a> Iterator for AnsiElementIterator<'a> {
     type Item = Element;
 
     fn next(&mut self) -> Option<Element> {
-        loop {
-            // If the last element emitted was text, then there may be a non-text element waiting
-            // to be emitted. In that case we do not consume a new byte.
-            let byte = if self.element.is_some() {
-                None
-            } else {
-                self.bytes.next()
-            };
-            if byte.is_some() || self.element.is_some() {
-                if let Some(byte) = byte {
-                    let mut performer = Performer {
-                        element: None,
-                        text_length: 0,
-                    };
-                    self.machine.advance(&mut performer, byte);
-                    self.element = performer.element;
-                    self.text_length += performer.text_length;
-                    self.pos += 1;
-                }
-                if self.element.is_some() {
-                    // There is a non-text element waiting to be emitted, but it may have preceding
-                    // text, which must be emitted first.
-                    if self.text_length > 0 {
-                        let start = self.start;
-                        self.start += self.text_length;
-                        self.text_length = 0;
-                        return Some(Element::Text(start, self.start));
-                    }
-                    let start = self.start;
-                    self.start = self.pos;
-                    let element = match self.element.as_ref().unwrap() {
-                        Element::Csi(style, _, _) => Element::Csi(*style, start, self.pos),
-                        Element::Esc(_, _) => Element::Esc(start, self.pos),
-                        Element::Osc(_, _) => Element::Osc(start, self.pos),
-                        Element::Text(_, _) => unreachable!(),
-                    };
-                    self.element = None;
-                    return Some(element);
-                }
-            } else if self.text_length > 0 {
-                self.text_length = 0;
-                return Some(Element::Text(self.start, self.pos));
-            } else {
-                return None;
+        // If the last element emitted was text, then there may be a non-text element waiting
+        // to be emitted. In that case we do not consume a new byte.
+        while self.element.is_none() {
+            match self.bytes.next() {
+                Some(b) => self.advance_vte(b),
+                None => break,
             }
         }
+
+        if let Some(mut element) = self.element.take() {
+            // There is a non-text element waiting to be emitted, but it may have preceding
+            // text, which must be emitted first.
+            if self.text_length > 0 {
+                let start = self.start;
+                self.start += self.text_length;
+                self.text_length = 0;
+                self.element = Some(element);
+                return Some(Element::Text(start, self.start));
+            }
+
+            let start = self.start;
+            self.start = self.pos;
+            element.set_range(start, self.pos);
+
+            return Some(element);
+        }
+
+        if self.text_length > 0 {
+            self.text_length = 0;
+            return Some(Element::Text(self.start, self.pos));
+        }
+
+        None
     }
 }
 
@@ -126,18 +126,21 @@ impl vte::Perform for Performer {
             return;
         }
 
-        if let ('m', None) = (c, intermediates.get(0)) {
+        let is_sgr = c == 'm' && intermediates.first().is_none();
+        let element = if is_sgr {
             if params.is_empty() {
                 // Attr::Reset
                 // Probably doesn't need to be handled: https://github.com/dandavison/delta/pull/431#discussion_r536883568
+                None
             } else {
-                self.element = Some(Element::Csi(
-                    ansi_term_style_from_sgr_parameters(&mut params.iter()),
-                    0,
-                    0,
-                ));
+                let style = ansi_term_style_from_sgr_parameters(&mut params.iter());
+                Some(Element::Sgr(style, 0, 0))
             }
-        }
+        } else {
+            Some(Element::Csi(0, 0))
+        };
+
+        self.element = element;
     }
 
     fn print(&mut self, c: char) {
@@ -288,13 +291,13 @@ mod tests {
             if *git_style_string == "normal" {
                 // This one has a different pattern
                 assert!(
-                    matches!(it.next().unwrap(), Element::Csi(s, _, _) if s == ansi_term::Style::default())
+                    matches!(it.next().unwrap(), Element::Sgr(s, _, _) if s == ansi_term::Style::default())
                 );
                 assert!(
                     matches!(it.next().unwrap(), Element::Text(i, j) if &git_output[i..j] == "text")
                 );
                 assert!(
-                    matches!(it.next().unwrap(), Element::Csi(s, _, _) if s == ansi_term::Style::default())
+                    matches!(it.next().unwrap(), Element::Sgr(s, _, _) if s == ansi_term::Style::default())
                 );
                 continue;
             }
@@ -302,11 +305,11 @@ mod tests {
             // First element should be a style
             let element = it.next().unwrap();
             match element {
-                Element::Csi(style, _, _) => assert!(style::ansi_term_style_equality(
+                Element::Sgr(style, _, _) => assert!(style::ansi_term_style_equality(
                     style,
                     style::Style::from_git_str(git_style_string).ansi_term_style
                 )),
-                _ => assert!(false),
+                _ => unreachable!(),
             }
 
             // Second element should be text: "+"
@@ -317,16 +320,16 @@ mod tests {
             // Third element is the reset style
             assert!(matches!(
                 it.next().unwrap(),
-                Element::Csi(s, _, _) if s == ansi_term::Style::default()));
+                Element::Sgr(s, _, _) if s == ansi_term::Style::default()));
 
             // Fourth element should be a style
             let element = it.next().unwrap();
             match element {
-                Element::Csi(style, _, _) => assert!(style::ansi_term_style_equality(
+                Element::Sgr(style, _, _) => assert!(style::ansi_term_style_equality(
                     style,
                     style::Style::from_git_str(git_style_string).ansi_term_style
                 )),
-                _ => assert!(false),
+                _ => unreachable!(),
             }
 
             // Fifth element should be text: "text"
@@ -337,7 +340,7 @@ mod tests {
             // Sixth element is the reset style
             assert!(matches!(
                 it.next().unwrap(),
-                Element::Csi(s, _, _) if s == ansi_term::Style::default()));
+                Element::Sgr(s, _, _) if s == ansi_term::Style::default()));
 
             assert!(matches!(
                 it.next().unwrap(),
@@ -354,7 +357,7 @@ mod tests {
         assert_eq!(
             actual_elements,
             vec![
-                Element::Csi(
+                Element::Sgr(
                     ansi_term::Style {
                         foreground: Some(ansi_term::Color::Red),
                         ..ansi_term::Style::default()
@@ -363,7 +366,7 @@ mod tests {
                     5
                 ),
                 Element::Text(5, 9),
-                Element::Csi(ansi_term::Style::default(), 9, 12),
+                Element::Sgr(ansi_term::Style::default(), 9, 12),
                 Element::Text(12, 13),
             ]
         );
@@ -378,7 +381,7 @@ mod tests {
         assert_eq!(
             actual_elements,
             vec![
-                Element::Csi(
+                Element::Sgr(
                     ansi_term::Style {
                         foreground: Some(ansi_term::Color::Red),
                         ..ansi_term::Style::default()
@@ -387,7 +390,7 @@ mod tests {
                     5
                 ),
                 Element::Text(5, 9),
-                Element::Csi(ansi_term::Style::default(), 9, 12),
+                Element::Sgr(ansi_term::Style::default(), 9, 12),
                 Element::Text(12, 16),
             ]
         );
@@ -402,7 +405,7 @@ mod tests {
         assert_eq!(
             actual_elements,
             vec![
-                Element::Csi(
+                Element::Sgr(
                     ansi_term::Style {
                         foreground: Some(ansi_term::Color::Red),
                         ..ansi_term::Style::default()
@@ -411,10 +414,40 @@ mod tests {
                     5
                 ),
                 Element::Text(5, 11),
-                Element::Csi(ansi_term::Style::default(), 11, 15),
+                Element::Sgr(ansi_term::Style::default(), 11, 15),
             ]
         );
         assert_eq!("バー", &s[5..11]);
+    }
+
+    #[test]
+    fn test_iterator_erase_in_line() {
+        let s = "\x1b[0Kあ.\x1b[m";
+        let actual_elements: Vec<Element> = AnsiElementIterator::new(s).collect();
+        assert_eq!(
+            actual_elements,
+            vec![
+                Element::Csi(0, 4),
+                Element::Text(4, 8),
+                Element::Sgr(ansi_term::Style::default(), 8, 11),
+            ]
+        );
+        assert_eq!("あ.", &s[4..8]);
+    }
+
+    #[test]
+    fn test_iterator_erase_in_line_without_n() {
+        let s = "\x1b[Kあ.\x1b[m";
+        let actual_elements: Vec<Element> = AnsiElementIterator::new(s).collect();
+        assert_eq!(
+            actual_elements,
+            vec![
+                Element::Csi(0, 3),
+                Element::Text(3, 7),
+                Element::Sgr(ansi_term::Style::default(), 7, 10),
+            ]
+        );
+        assert_eq!("あ.", &s[3..7]);
     }
 
     #[test]
@@ -435,7 +468,7 @@ mod tests {
         assert_eq!(
             actual_elements,
             vec![
-                Element::Csi(
+                Element::Sgr(
                     ansi_term::Style {
                         foreground: Some(ansi_term::Color::Fixed(4)),
                         ..ansi_term::Style::default()
@@ -448,7 +481,7 @@ mod tests {
                 Element::Text(59, 80),
                 Element::Osc(80, 86),
                 Element::Esc(86, 87),
-                Element::Csi(ansi_term::Style::default(), 87, 91),
+                Element::Sgr(ansi_term::Style::default(), 87, 91),
                 Element::Text(91, 92),
             ]
         );

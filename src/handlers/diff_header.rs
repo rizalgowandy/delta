@@ -6,17 +6,19 @@ use unicode_segmentation::UnicodeSegmentation;
 use super::draw;
 use crate::config::Config;
 use crate::delta::{DiffType, Source, State, StateMachine};
-use crate::features;
 use crate::paint::Painter;
+use crate::{features, utils};
 
 // https://git-scm.com/docs/git-config#Documentation/git-config.txt-diffmnemonicPrefix
 const DIFF_PREFIXES: [&str; 6] = ["a/", "b/", "c/", "i/", "o/", "w/"];
 
-#[derive(Debug, PartialEq)]
+#[derive(Debug, PartialEq, Eq)]
 pub enum FileEvent {
+    Added,
     Change,
     Copy,
     Rename,
+    Removed,
     NoEvent,
 }
 
@@ -49,6 +51,25 @@ impl<'a> StateMachine<'a> {
         Ok(handled_line)
     }
 
+    fn should_write_generic_diff_header_header_line(&mut self) -> std::io::Result<bool> {
+        // In color_only mode, raw_line's structure shouldn't be changed.
+        // So it needs to avoid fn _handle_diff_header_header_line
+        // (it connects the plus_file and minus_file),
+        // and to call fn handle_generic_diff_header_header_line directly.
+        if self.config.color_only {
+            write_generic_diff_header_header_line(
+                &self.line,
+                &self.raw_line,
+                &mut self.painter,
+                &mut self.mode_info,
+                self.config,
+            )?;
+            Ok(true)
+        } else {
+            Ok(false)
+        }
+    }
+
     #[inline]
     fn test_diff_header_minus_line(&self) -> bool {
         (matches!(self.state, State::DiffHeader(_)) || self.source == Source::DiffUnified)
@@ -62,18 +83,13 @@ impl<'a> StateMachine<'a> {
         if !self.test_diff_header_minus_line() {
             return Ok(false);
         }
-        let mut handled_line = false;
 
-        let (path_or_mode, file_event) = parse_diff_header_line(
-            &self.line,
-            self.source == Source::GitDiff,
-            if self.config.relative_paths {
-                self.config.cwd_relative_to_repo_root.as_deref()
-            } else {
-                None
-            },
-        );
-        self.minus_file = path_or_mode;
+        let (path_or_mode, file_event) =
+            parse_diff_header_line(&self.line, self.source == Source::GitDiff);
+
+        self.minus_file = utils::path::relativize_path_maybe(&path_or_mode, self.config)
+            .map(|p| p.to_string_lossy().into_owned())
+            .unwrap_or(path_or_mode);
         self.minus_file_event = file_event;
 
         if self.source == Source::DiffUnified {
@@ -87,21 +103,8 @@ impl<'a> StateMachine<'a> {
                 ));
         }
 
-        // In color_only mode, raw_line's structure shouldn't be changed.
-        // So it needs to avoid fn _handle_diff_header_header_line
-        // (it connects the plus_file and minus_file),
-        // and to call fn handle_generic_diff_header_header_line directly.
-        if self.config.color_only {
-            write_generic_diff_header_header_line(
-                &self.line,
-                &self.raw_line,
-                &mut self.painter,
-                &mut self.mode_info,
-                self.config,
-            )?;
-            handled_line = true;
-        }
-        Ok(handled_line)
+        self.painter.paint_buffered_minus_and_plus_lines();
+        self.should_write_generic_diff_header_header_line()
     }
 
     #[inline]
@@ -118,16 +121,12 @@ impl<'a> StateMachine<'a> {
             return Ok(false);
         }
         let mut handled_line = false;
-        let (path_or_mode, file_event) = parse_diff_header_line(
-            &self.line,
-            self.source == Source::GitDiff,
-            if self.config.relative_paths {
-                self.config.cwd_relative_to_repo_root.as_deref()
-            } else {
-                None
-            },
-        );
-        self.plus_file = path_or_mode;
+        let (path_or_mode, file_event) =
+            parse_diff_header_line(&self.line, self.source == Source::GitDiff);
+
+        self.plus_file = utils::path::relativize_path_maybe(&path_or_mode, self.config)
+            .map(|p| p.to_string_lossy().into_owned())
+            .unwrap_or(path_or_mode);
         self.plus_file_event = file_event;
         self.painter
             .set_syntax(get_file_extension_from_diff_header_line_file_path(
@@ -135,25 +134,58 @@ impl<'a> StateMachine<'a> {
             ));
         self.current_file_pair = Some((self.minus_file.clone(), self.plus_file.clone()));
 
-        // In color_only mode, raw_line's structure shouldn't be changed.
-        // So it needs to avoid fn _handle_diff_header_header_line
-        // (it connects the plus_file and minus_file),
-        // and to call fn handle_generic_diff_header_header_line directly.
-        if self.config.color_only {
-            write_generic_diff_header_header_line(
-                &self.line,
-                &self.raw_line,
-                &mut self.painter,
-                &mut self.mode_info,
-                self.config,
-            )?;
-            handled_line = true
+        self.painter.paint_buffered_minus_and_plus_lines();
+        if self.should_write_generic_diff_header_header_line()? {
+            handled_line = true;
         } else if self.should_handle()
             && self.handled_diff_header_header_line_file_pair != self.current_file_pair
         {
             self.painter.emit()?;
             self._handle_diff_header_header_line(self.source == Source::DiffUnified)?;
-            self.handled_diff_header_header_line_file_pair = self.current_file_pair.clone()
+            self.handled_diff_header_header_line_file_pair = self.current_file_pair.clone();
+        }
+        Ok(handled_line)
+    }
+
+    #[inline]
+    fn test_diff_header_file_operation_line(&self) -> bool {
+        (matches!(self.state, State::DiffHeader(_)) || self.source == Source::DiffUnified)
+            && (self.line.starts_with("deleted file mode ")
+                || self.line.starts_with("new file mode "))
+    }
+
+    /// Check for and handle the "deleted file ..."  line.
+    pub fn handle_diff_header_file_operation_line(&mut self) -> std::io::Result<bool> {
+        if !self.test_diff_header_file_operation_line() {
+            return Ok(false);
+        }
+        let mut handled_line = false;
+        let (_mode_info, file_event) =
+            parse_diff_header_line(&self.line, self.source == Source::GitDiff);
+        let name = get_repeated_file_path_from_diff_line(&self.diff_line).unwrap_or_default();
+        match file_event {
+            FileEvent::Removed => {
+                self.minus_file = name;
+                self.plus_file = "/dev/null".into();
+                self.minus_file_event = FileEvent::Change;
+                self.plus_file_event = FileEvent::Change;
+                self.current_file_pair = Some((self.minus_file.clone(), self.plus_file.clone()));
+            }
+            FileEvent::Added => {
+                self.minus_file = "/dev/null".into();
+                self.plus_file = name;
+                self.minus_file_event = FileEvent::Change;
+                self.plus_file_event = FileEvent::Change;
+                self.current_file_pair = Some((self.minus_file.clone(), self.plus_file.clone()));
+            }
+            _ => (),
+        }
+
+        if self.should_write_generic_diff_header_header_line()?
+            || (self.should_handle()
+                && self.handled_diff_header_header_line_file_pair != self.current_file_pair)
+        {
+            handled_line = true;
         }
         Ok(handled_line)
     }
@@ -178,25 +210,38 @@ impl<'a> StateMachine<'a> {
         )
     }
 
-    pub fn handle_pending_mode_line_with_diff_name(&mut self) -> std::io::Result<()> {
+    #[inline]
+    fn test_pending_line_with_diff_name(&self) -> bool {
+        matches!(self.state, State::DiffHeader(_)) || self.source == Source::DiffUnified
+    }
+
+    pub fn handle_pending_line_with_diff_name(&mut self) -> std::io::Result<()> {
+        if !self.test_pending_line_with_diff_name() {
+            return Ok(());
+        }
+
         if !self.mode_info.is_empty() {
             let format_label = |label: &str| {
                 if !label.is_empty() {
-                    format!("{} ", label)
+                    format!("{label} ")
                 } else {
                     "".to_string()
                 }
             };
-            let format_file = |file| {
-                if self.config.hyperlinks {
-                    features::hyperlinks::format_osc8_file_hyperlink(file, None, file, self.config)
-                } else {
-                    Cow::from(file)
-                }
+            let format_file = |file| match (
+                self.config.hyperlinks,
+                utils::path::absolute_path(file, self.config),
+            ) {
+                (true, Some(absolute_path)) => features::hyperlinks::format_osc8_file_hyperlink(
+                    absolute_path,
+                    None,
+                    file,
+                    self.config,
+                ),
+                _ => Cow::from(file),
             };
             let label = format_label(&self.config.file_modified_label);
-            let name = get_repeated_file_path_from_diff_line(&self.diff_line)
-                .unwrap_or_else(|| "".to_string());
+            let name = get_repeated_file_path_from_diff_line(&self.diff_line).unwrap_or_default();
             let line = format!("{}{}", label, format_file(&name));
             write_generic_diff_header_header_line(
                 &line,
@@ -205,6 +250,13 @@ impl<'a> StateMachine<'a> {
                 &mut self.mode_info,
                 self.config,
             )
+        } else if !self.config.color_only
+            && self.should_handle()
+            && self.handled_diff_header_header_line_file_pair != self.current_file_pair
+        {
+            self._handle_diff_header_header_line(self.source == Source::DiffUnified)?;
+            self.handled_diff_header_header_line_file_pair = self.current_file_pair.clone();
+            Ok(())
         } else {
             Ok(())
         }
@@ -274,12 +326,8 @@ pub fn get_extension(s: &str) -> Option<&str> {
         .or_else(|| path.file_name().and_then(|s| s.to_str()))
 }
 
-fn parse_diff_header_line(
-    line: &str,
-    git_diff_name: bool,
-    relative_path_base: Option<&str>,
-) -> (String, FileEvent) {
-    let (mut path_or_mode, file_event) = match line {
+fn parse_diff_header_line(line: &str, git_diff_name: bool) -> (String, FileEvent) {
+    match line {
         line if line.starts_with("--- ") || line.starts_with("+++ ") => {
             let offset = 4;
             let file = _parse_file_path(&line[offset..], git_diff_name);
@@ -297,18 +345,14 @@ fn parse_diff_header_line(
         line if line.starts_with("copy to ") => {
             (line[8..].to_string(), FileEvent::Copy) // "copy to ".len()
         }
-        _ => ("".to_string(), FileEvent::NoEvent),
-    };
-
-    if let Some(base) = relative_path_base {
-        if let Some(relative_path) = pathdiff::diff_paths(&path_or_mode, base) {
-            if let Some(relative_path) = relative_path.to_str() {
-                path_or_mode = relative_path.to_owned();
-            }
+        line if line.starts_with("new file mode ") => {
+            (line[14..].to_string(), FileEvent::Added) // "new file mode ".len()
         }
+        line if line.starts_with("deleted file mode ") => {
+            (line[18..].to_string(), FileEvent::Removed) // "deleted file mode ".len()
+        }
+        _ => ("".to_string(), FileEvent::NoEvent),
     }
-
-    (path_or_mode, file_event)
 }
 
 /// Given input like "diff --git a/src/my file.rs b/src/my file.rs"
@@ -328,6 +372,15 @@ fn get_repeated_file_path_from_diff_line(line: &str) -> Option<String> {
     None
 }
 
+fn remove_surrounding_quotes(path: &str) -> &str {
+    if path.starts_with('"') && path.ends_with('"') {
+        // Indexing into the UTF-8 string is safe because of the previous test
+        &path[1..path.len() - 1]
+    } else {
+        path
+    }
+}
+
 fn _parse_file_path(s: &str, git_diff_name: bool) -> String {
     // It appears that, if the file name contains a space, git appends a tab
     // character in the diff metadata lines, e.g.
@@ -336,13 +389,15 @@ fn _parse_file_path(s: &str, git_diff_name: bool) -> String {
     // index·d00491f..0cfbf08·100644␊
     // ---·a/a·b├──┤␊
     // +++·b/c·d├──┤␊
-    match s.strip_suffix('\t').unwrap_or(s) {
+    let path = match s.strip_suffix('\t').unwrap_or(s) {
         path if path == "/dev/null" => "/dev/null",
         path if git_diff_name && DIFF_PREFIXES.iter().any(|s| path.starts_with(s)) => &path[2..],
         path if git_diff_name => path,
         path => path.split('\t').next().unwrap_or(""),
-    }
-    .to_string()
+    };
+    // When a path contains non-ASCII characters, a backslash, or a quote then it is quoted,
+    // so remove these quotes. Characters may also be escaped, but these are left as-is.
+    remove_surrounding_quotes(path).to_string()
 }
 
 pub fn get_file_change_description_from_file_paths(
@@ -355,7 +410,7 @@ pub fn get_file_change_description_from_file_paths(
 ) -> String {
     let format_label = |label: &str| {
         if !label.is_empty() {
-            format!("{} ", label)
+            format!("{label} ")
         } else {
             "".to_string()
         }
@@ -370,10 +425,19 @@ pub fn get_file_change_description_from_file_paths(
         )
     } else {
         let format_file = |file| {
-            if config.hyperlinks {
-                features::hyperlinks::format_osc8_file_hyperlink(file, None, file, config)
+            let formatted_file = if let Some(regex_replacement) = &config.file_regex_replacement {
+                regex_replacement.execute(file)
             } else {
                 Cow::from(file)
+            };
+            match (config.hyperlinks, utils::path::absolute_path(file, config)) {
+                (true, Some(absolute_path)) => features::hyperlinks::format_osc8_file_hyperlink(
+                    absolute_path,
+                    None,
+                    &formatted_file,
+                    config,
+                ),
+                _ => formatted_file,
             }
         };
         match (minus_file, plus_file, minus_file_event, plus_file_event) {
@@ -479,45 +543,50 @@ mod tests {
     #[test]
     fn test_get_file_path_from_git_diff_header_line() {
         assert_eq!(
-            parse_diff_header_line("--- /dev/null", true, None),
+            parse_diff_header_line("--- /dev/null", true),
             ("/dev/null".to_string(), FileEvent::Change)
         );
         for prefix in &DIFF_PREFIXES {
             assert_eq!(
-                parse_diff_header_line(&format!("--- {}src/delta.rs", prefix), true, None),
+                parse_diff_header_line(&format!("--- {prefix}src/delta.rs"), true),
                 ("src/delta.rs".to_string(), FileEvent::Change)
             );
         }
         assert_eq!(
-            parse_diff_header_line("--- src/delta.rs", true, None),
+            parse_diff_header_line("--- src/delta.rs", true),
             ("src/delta.rs".to_string(), FileEvent::Change)
         );
         assert_eq!(
-            parse_diff_header_line("+++ src/delta.rs", true, None),
+            parse_diff_header_line("+++ src/delta.rs", true),
             ("src/delta.rs".to_string(), FileEvent::Change)
+        );
+
+        assert_eq!(
+            parse_diff_header_line("+++ \".\\delta.rs\"", true),
+            (".\\delta.rs".to_string(), FileEvent::Change)
         );
     }
 
     #[test]
     fn test_get_file_path_from_git_diff_header_line_containing_spaces() {
         assert_eq!(
-            parse_diff_header_line("+++ a/my src/delta.rs", true, None),
+            parse_diff_header_line("+++ a/my src/delta.rs", true),
             ("my src/delta.rs".to_string(), FileEvent::Change)
         );
         assert_eq!(
-            parse_diff_header_line("+++ my src/delta.rs", true, None),
+            parse_diff_header_line("+++ my src/delta.rs", true),
             ("my src/delta.rs".to_string(), FileEvent::Change)
         );
         assert_eq!(
-            parse_diff_header_line("+++ a/src/my delta.rs", true, None),
+            parse_diff_header_line("+++ a/src/my delta.rs", true),
             ("src/my delta.rs".to_string(), FileEvent::Change)
         );
         assert_eq!(
-            parse_diff_header_line("+++ a/my src/my delta.rs", true, None),
+            parse_diff_header_line("+++ a/my src/my delta.rs", true),
             ("my src/my delta.rs".to_string(), FileEvent::Change)
         );
         assert_eq!(
-            parse_diff_header_line("+++ b/my src/my enough/my delta.rs", true, None),
+            parse_diff_header_line("+++ b/my src/my enough/my delta.rs", true),
             (
                 "my src/my enough/my delta.rs".to_string(),
                 FileEvent::Change
@@ -528,7 +597,7 @@ mod tests {
     #[test]
     fn test_get_file_path_from_git_diff_header_line_rename() {
         assert_eq!(
-            parse_diff_header_line("rename from nospace/file2.el", true, None),
+            parse_diff_header_line("rename from nospace/file2.el", true),
             ("nospace/file2.el".to_string(), FileEvent::Rename)
         );
     }
@@ -536,7 +605,7 @@ mod tests {
     #[test]
     fn test_get_file_path_from_git_diff_header_line_rename_containing_spaces() {
         assert_eq!(
-            parse_diff_header_line("rename from with space/file1.el", true, None),
+            parse_diff_header_line("rename from with space/file1.el", true),
             ("with space/file1.el".to_string(), FileEvent::Rename)
         );
     }
@@ -544,11 +613,11 @@ mod tests {
     #[test]
     fn test_parse_diff_header_line() {
         assert_eq!(
-            parse_diff_header_line("--- src/delta.rs", false, None),
+            parse_diff_header_line("--- src/delta.rs", false),
             ("src/delta.rs".to_string(), FileEvent::Change)
         );
         assert_eq!(
-            parse_diff_header_line("+++ src/delta.rs", false, None),
+            parse_diff_header_line("+++ src/delta.rs", false),
             ("src/delta.rs".to_string(), FileEvent::Change)
         );
     }

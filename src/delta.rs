@@ -1,20 +1,22 @@
 use std::borrow::Cow;
 use std::collections::HashMap;
-use std::io::BufRead;
-use std::io::Write;
+use std::io::{self, BufRead, IsTerminal, Write};
 
 use bytelines::ByteLines;
 
 use crate::ansi;
 use crate::config::delta_unreachable;
 use crate::config::Config;
+use crate::config::GrepType;
 use crate::features;
+use crate::handlers::grep;
 use crate::handlers::hunk_header::ParsedHunkHeader;
 use crate::handlers::{self, merge_conflict};
 use crate::paint::Painter;
 use crate::style::DecorationStyle;
+use crate::utils;
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum State {
     CommitMeta,                                             // In commit metadata section
     DiffHeader(DiffType), // In diff metadata section, between (possible) commit metadata and first hunk
@@ -27,7 +29,7 @@ pub enum State {
     SubmoduleShort(String), // In a submodule section, with gitconfig diff.submodule = short
     Blame(String), // In a line of `git blame` output (key).
     GitShowFile,  // In a line of `git show $revision:./path/to/file.ext` output
-    Grep,         // In a line of `git grep` output
+    Grep(GrepType, grep::LineType, String, Option<usize>), // In a line of `git grep` output (grep_type, line_type, path, line_number)
     Unknown,
     // The following elements are created when a line is wrapped to display it:
     HunkZeroWrapped,  // Wrapped unchanged line
@@ -35,21 +37,21 @@ pub enum State {
     HunkPlusWrapped,  // Wrapped added line
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum DiffType {
     Unified,
     // https://git-scm.com/docs/git-diff#_combined_diff_format
     Combined(MergeParents, InMergeConflict),
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum MergeParents {
     Number(usize),  // Number of parent commits == (number of @s in hunk header) - 1
     Prefix(String), // Hunk line prefix, length == number of parent commits
     Unknown,
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum InMergeConflict {
     Yes,
     No,
@@ -68,7 +70,7 @@ impl DiffType {
     }
 }
 
-#[derive(Debug, PartialEq)]
+#[derive(Debug, PartialEq, Eq)]
 pub enum Source {
     GitDiff,     // Coming from a `git diff` command
     DiffUnified, // Coming from a `diff -u` command
@@ -157,6 +159,7 @@ impl<'a> StateMachine<'a> {
             let _ = self.handle_commit_meta_header_line()?
                 || self.handle_diff_stat_line()?
                 || self.handle_diff_header_diff_line()?
+                || self.handle_diff_header_file_operation_line()?
                 || self.handle_diff_header_minus_line()?
                 || self.handle_diff_header_plus_line()?
                 || self.handle_hunk_header_line()?
@@ -173,19 +176,34 @@ impl<'a> StateMachine<'a> {
                 || self.emit_line_unchanged()?;
         }
 
-        self.handle_pending_mode_line_with_diff_name()?;
+        self.handle_pending_line_with_diff_name()?;
         self.painter.paint_buffered_minus_and_plus_lines();
         self.painter.emit()?;
         Ok(())
     }
 
     fn ingest_line(&mut self, raw_line_bytes: &[u8]) {
-        // TODO: retain raw_line as Cow
-        self.raw_line = String::from_utf8_lossy(raw_line_bytes).to_string();
+        match String::from_utf8(raw_line_bytes.to_vec()) {
+            Ok(utf8) => self.ingest_line_utf8(utf8),
+            Err(_) => {
+                let raw_line = String::from_utf8_lossy(raw_line_bytes);
+                let truncated_len = utils::round_char_boundary::floor_char_boundary(
+                    &raw_line,
+                    self.config.max_line_length,
+                );
+                self.raw_line = raw_line[..truncated_len].to_string();
+                self.line = self.raw_line.clone();
+            }
+        }
+    }
+
+    fn ingest_line_utf8(&mut self, raw_line: String) {
+        self.raw_line = raw_line;
         // When a file has \r\n line endings, git sometimes adds ANSI escape sequences between the
         // \r and \n, in which case byte_lines does not remove the \r. Remove it now.
+        // TODO: Limit the number of characters we examine when looking for the \r?
         if let Some(cr_index) = self.raw_line.rfind('\r') {
-            if ansi::strip_ansi_codes(&self.raw_line[cr_index + 1..]).is_empty() {
+            if ansi::measure_text_width(&self.raw_line[cr_index + 1..]) == 0 {
                 self.raw_line = format!(
                     "{}{}",
                     &self.raw_line[..cr_index],
@@ -241,7 +259,7 @@ impl<'a> StateMachine<'a> {
 /// If output is going to a tty, emit hyperlinks if requested.
 // Although raw output should basically be emitted unaltered, we do this.
 pub fn format_raw_line<'a>(line: &'a str, config: &Config) -> Cow<'a, str> {
-    if config.hyperlinks && atty::is(atty::Stream::Stdout) {
+    if config.hyperlinks && io::stdout().is_terminal() {
         features::hyperlinks::format_commit_line_with_osc8_commit_hyperlink(line, config)
     } else {
         Cow::from(line)

@@ -12,6 +12,7 @@ use crate::ansi;
 use crate::cli;
 use crate::config;
 use crate::delta::delta;
+use crate::env::DeltaEnv;
 use crate::git_config::GitConfig;
 use crate::tests::test_utils;
 use crate::utils::process::tests::FakeParentArgs;
@@ -21,34 +22,51 @@ pub fn make_options_from_args_and_git_config(
     git_config_contents: Option<&[u8]>,
     git_config_path: Option<&str>,
 ) -> cli::Opt {
-    _make_options_from_args_and_git_config(args, git_config_contents, git_config_path, false)
+    _make_options_from_args_and_git_config(
+        DeltaEnv::default(),
+        args,
+        git_config_contents,
+        git_config_path,
+        false,
+    )
 }
 
-pub fn make_options_from_args_and_git_config_honoring_env_var(
+pub fn make_options_from_args_and_git_config_with_custom_env(
+    env: DeltaEnv,
     args: &[&str],
     git_config_contents: Option<&[u8]>,
     git_config_path: Option<&str>,
 ) -> cli::Opt {
-    _make_options_from_args_and_git_config(args, git_config_contents, git_config_path, true)
+    _make_options_from_args_and_git_config(env, args, git_config_contents, git_config_path, false)
+}
+
+pub fn make_options_from_args_and_git_config_honoring_env_var_with_custom_env(
+    env: DeltaEnv,
+    args: &[&str],
+    git_config_contents: Option<&[u8]>,
+    git_config_path: Option<&str>,
+) -> cli::Opt {
+    _make_options_from_args_and_git_config(env, args, git_config_contents, git_config_path, true)
 }
 
 fn _make_options_from_args_and_git_config(
+    env: DeltaEnv,
     args: &[&str],
     git_config_contents: Option<&[u8]>,
     git_config_path: Option<&str>,
     honor_env_var: bool,
 ) -> cli::Opt {
     let mut args: Vec<&str> = itertools::chain(&["/dev/null", "/dev/null"], args)
-        .map(|s| *s)
+        .copied()
         .collect();
     let git_config = match (git_config_contents, git_config_path) {
-        (Some(contents), Some(path)) => Some(make_git_config(contents, path, honor_env_var)),
+        (Some(contents), Some(path)) => Some(make_git_config(&env, contents, path, honor_env_var)),
         _ => {
             args.push("--no-gitconfig");
             None
         }
     };
-    cli::Opt::from_iter_and_git_config(args, git_config)
+    cli::Opt::from_iter_and_git_config(env, args, git_config)
 }
 
 pub fn make_options_from_args(args: &[&str]) -> cli::Opt {
@@ -72,11 +90,16 @@ pub fn make_config_from_args(args: &[&str]) -> config::Config {
     config::Config::from(make_options_from_args(args))
 }
 
-pub fn make_git_config(contents: &[u8], path: &str, honor_env_var: bool) -> GitConfig {
+pub fn make_git_config(
+    env: &DeltaEnv,
+    contents: &[u8],
+    path: &str,
+    honor_env_var: bool,
+) -> GitConfig {
     let path = Path::new(path);
     let mut file = File::create(path).unwrap();
     file.write_all(contents).unwrap();
-    GitConfig::from_path(&path, honor_env_var)
+    GitConfig::from_path(env, path, honor_env_var)
 }
 
 pub fn get_line_of_code_from_delta(
@@ -85,7 +108,7 @@ pub fn get_line_of_code_from_delta(
     expected_text: &str,
     config: &config::Config,
 ) -> String {
-    let output = run_delta(&input, config);
+    let output = run_delta(input, config);
     let line_of_code = output.lines().nth(line_number).unwrap();
     assert!(ansi::strip_ansi_codes(line_of_code) == expected_text);
     line_of_code.to_string()
@@ -145,7 +168,7 @@ pub fn delineated_string(txt: &str) -> String {
     let top = "▼".repeat(100);
     let btm = "▲".repeat(100);
     let nl = "\n";
-    top + &nl + txt + &nl + &btm
+    top + nl + txt + nl + &btm
 }
 
 pub struct DeltaTest<'a> {
@@ -217,7 +240,7 @@ impl DeltaTestOutput {
     /// with ASCII explanation of ANSI escape sequences.
     #[allow(unused)]
     pub fn inspect(self) -> Self {
-        eprintln!("{}", delineated_string(&self.output.as_str()));
+        eprintln!("{}", delineated_string(&self.output));
         self
     }
 
@@ -244,9 +267,9 @@ impl DeltaTestOutput {
     pub fn expect_contains(self, expected: &str) -> Self {
         assert!(
             self.output.contains(expected),
-            "Output does not contain \"{}\":\n{}",
+            "Output does not contain \"{}\":\n{}\n",
             expected,
-            delineated_string(&self.output.as_str())
+            delineated_string(&self.output)
         );
         self
     }
@@ -254,9 +277,9 @@ impl DeltaTestOutput {
     pub fn expect_raw_contains(self, expected: &str) -> Self {
         assert!(
             self.raw_output.contains(expected),
-            "Raw output does not contain \"{}\":\n{}",
+            "Raw output does not contain \"{}\":\n{}\n",
             expected,
-            delineated_string(&self.raw_output.as_str())
+            delineated_string(&self.raw_output)
         );
         self
     }
@@ -264,9 +287,9 @@ impl DeltaTestOutput {
     pub fn expect_contains_once(self, expected: &str) -> Self {
         assert!(
             test_utils::contains_once(&self.output, expected),
-            "Output does not contain \"{}\" exactly once:\n{}",
+            "Output does not contain \"{}\" exactly once:\n{}\n",
             expected,
-            delineated_string(&self.output.as_str())
+            delineated_string(&self.output)
         );
         self
     }
@@ -278,7 +301,7 @@ pub fn run_delta(input: &str, config: &config::Config) -> String {
     delta(
         ByteLines::new(BufReader::new(input.as_bytes())),
         &mut writer,
-        &config,
+        config,
     )
     .unwrap();
     String::from_utf8(writer).unwrap()
@@ -368,8 +391,8 @@ ignored!  2
                 r#"
                  #indent_mark
                  @@ -1,1 +1,1 @@ fn foo() {
-                  1  ⋮    │-1
-                     ⋮ 1  │+2"#,
+                   1 ⋮    │-1
+                     ⋮  1 │+2"#,
             );
 
         DeltaTest::with_args(&[])

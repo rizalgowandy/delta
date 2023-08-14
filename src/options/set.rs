@@ -3,19 +3,18 @@ use std::convert::TryInto;
 use std::result::Result;
 use std::str::FromStr;
 
+use bat::assets::HighlightingAssets;
 use console::Term;
-use structopt::clap;
 
 use crate::cli;
 use crate::config;
-use crate::env;
+use crate::env::DeltaEnv;
 use crate::errors::*;
 use crate::fatal;
 use crate::features;
-use crate::git_config::{GitConfig, GitConfigEntry};
+use crate::git_config::GitConfig;
 use crate::options::option_value::{OptionValue, ProvenancedOptionValue};
 use crate::options::theme;
-use crate::utils::bat::assets::HighlightingAssets;
 use crate::utils::bat::output::PagingMode;
 
 macro_rules! set_options {
@@ -23,9 +22,9 @@ macro_rules! set_options {
     $opt:expr, $builtin_features:expr, $git_config:expr, $arg_matches:expr, $expected_option_name_map:expr, $check_names:expr) => {
         let mut option_names = HashSet::new();
         $(
-            let kebab_case_field_name = stringify!($field_ident).replace("_", "-");
-            let option_name = $expected_option_name_map[kebab_case_field_name.as_str()];
-            if !$crate::config::user_supplied_option(&option_name, $arg_matches) {
+            let field_name = stringify!($field_ident);
+            let option_name = &$expected_option_name_map[field_name];
+            if !$crate::config::user_supplied_option(&field_name, $arg_matches) {
                 if let Some(value) = $crate::options::get::get_option_value(
                     option_name,
                     &$builtin_features,
@@ -36,7 +35,7 @@ macro_rules! set_options {
                 }
             }
             if $check_names {
-                option_names.insert(option_name);
+                option_names.insert(option_name.as_str());
             }
         )*
         if $check_names {
@@ -51,7 +50,10 @@ macro_rules! set_options {
                 "light",
                 "syntax-theme",
             ]);
-            let expected_option_names: HashSet<_> = $expected_option_name_map.values().cloned().collect();
+            let expected_option_names: HashSet<_> = $expected_option_name_map
+                .values()
+                .map(String::as_str)
+                .collect();
 
             if option_names != expected_option_names {
                 $crate::config::delta_unreachable(
@@ -73,21 +75,20 @@ pub fn set_options(
         if opt.no_gitconfig {
             git_config.enabled = false;
         }
-        set_git_config_entries(opt, git_config);
     }
-    opt.navigate = opt.navigate || env::get_boolean_env_var("DELTA_NAVIGATE");
+    opt.navigate = opt.navigate || opt.env.navigate.is_some();
     if opt.syntax_theme.is_none() {
-        opt.syntax_theme = env::get_env_var("BAT_THEME")
+        opt.syntax_theme = opt.env.bat_theme.clone();
     }
 
-    let option_names = cli::Opt::get_option_names();
+    let option_names = cli::Opt::get_argument_and_option_names();
 
     // Set features
     let mut builtin_features = features::make_builtin_features();
 
     // --color-only is used for interactive.diffFilter (git add -p) and side-by-side cannot be used
     // there (does not emit lines in 1-1 correspondence with raw git output). See #274.
-    if config::user_supplied_option("color-only", arg_matches) {
+    if config::user_supplied_option("color_only", arg_matches) {
         builtin_features.remove("side-by-side");
     }
 
@@ -100,12 +101,12 @@ pub fn set_options(
     // HACK: make minus-line styles have syntax-highlighting iff side-by-side.
     if features.contains(&"side-by-side".to_string()) {
         let prefix = "normal ";
-        if !config::user_supplied_option("minus-style", arg_matches)
+        if !config::user_supplied_option("minus_style", arg_matches)
             && opt.minus_style.starts_with(prefix)
         {
             opt.minus_style = format!("syntax {}", &opt.minus_style[prefix.len()..]);
         }
-        if !config::user_supplied_option("minus-emph-style", arg_matches)
+        if !config::user_supplied_option("minus_emph_style", arg_matches)
             && opt.minus_emph_style.starts_with(prefix)
         {
             opt.minus_emph_style = format!("syntax {}", &opt.minus_emph_style[prefix.len()..]);
@@ -114,7 +115,7 @@ pub fn set_options(
 
     // Handle options which default to an arbitrary git config value.
     // TODO: incorporate this logic into the set_options macro.
-    if !config::user_supplied_option("whitespace-error-style", arg_matches) {
+    if !config::user_supplied_option("whitespace_error_style", arg_matches) {
         opt.whitespace_error_style = if let Some(git_config) = git_config {
             git_config.get::<String>("color.diff.whitespace")
         } else {
@@ -127,11 +128,13 @@ pub fn set_options(
         [
             blame_code_style,
             blame_format,
+            blame_separator_format,
             blame_palette,
-            blame_separator,
             blame_separator_style,
             blame_timestamp_format,
+            blame_timestamp_output_format,
             color_only,
+            config,
             commit_decoration_style,
             commit_regex,
             commit_style,
@@ -149,6 +152,9 @@ pub fn set_options(
             file_style,
             grep_context_line_style,
             grep_file_style,
+            grep_header_decoration_style,
+            grep_header_file_style,
+            grep_output_type,
             grep_line_number_style,
             grep_match_line_style,
             grep_match_word_style,
@@ -249,7 +255,7 @@ fn set__light__dark__syntax_theme__options(
     opt: &mut cli::Opt,
     git_config: &mut Option<GitConfig>,
     arg_matches: &clap::ArgMatches,
-    option_names: &HashMap<&str, &str>,
+    option_names: &HashMap<String, String>,
 ) {
     let validate_light_and_dark = |opt: &cli::Opt| {
         if opt.light && opt.dark {
@@ -335,7 +341,7 @@ fn gather_features(
     builtin_features: &HashMap<String, features::BuiltinFeature>,
     git_config: &Option<GitConfig>,
 ) -> Vec<String> {
-    let from_env_var = env::get_env_var("DELTA_FEATURES");
+    let from_env_var = &opt.env.features;
     let from_args = opt.features.as_deref().unwrap_or("");
     let input_features: Vec<&str> = match from_env_var.as_deref() {
         Some(from_env_var) if from_env_var.starts_with('+') => from_env_var[1..]
@@ -363,7 +369,7 @@ fn gather_features(
     }
 
     // Gather builtin feature flags supplied on command line.
-    // TODO: Iterate over programatically-obtained names of builtin features.
+    // TODO: Iterate over programmatically-obtained names of builtin features.
     if opt.raw {
         gather_builtin_features_recursively("raw", &mut features, builtin_features, opt);
     }
@@ -430,7 +436,7 @@ fn gather_features_recursively(
     } else {
         features.push_front(feature.to_string());
     }
-    if let Some(child_features) = git_config.get::<String>(&format!("delta.{}.features", feature)) {
+    if let Some(child_features) = git_config.get::<String>(&format!("delta.{feature}.features")) {
         for child_feature in split_feature_string(&child_features) {
             if !features.contains(&child_feature.to_string()) {
                 gather_features_recursively(
@@ -444,7 +450,7 @@ fn gather_features_recursively(
         }
     }
     gather_builtin_features_from_flags_in_gitconfig(
-        &format!("delta.{}", feature),
+        &format!("delta.{feature}"),
         features,
         builtin_features,
         opt,
@@ -462,12 +468,8 @@ fn gather_builtin_features_from_flags_in_gitconfig(
     git_config: &GitConfig,
 ) {
     for child_feature in builtin_features.keys() {
-        if let Some(value) =
-            git_config.get::<bool>(&format!("{}.{}", git_config_key, child_feature))
-        {
-            if value {
-                gather_builtin_features_recursively(child_feature, features, builtin_features, opt);
-            }
+        if let Some(true) = git_config.get::<bool>(&format!("{git_config_key}.{child_feature}")) {
+            gather_builtin_features_recursively(child_feature, features, builtin_features, opt);
         }
     }
 }
@@ -506,17 +508,15 @@ fn gather_builtin_features_recursively(
         }
         for child_feature in builtin_features.keys() {
             if let Some(child_features_fn) = feature_data.get(child_feature) {
-                if let ProvenancedOptionValue::DefaultValue(OptionValue::Boolean(value)) =
+                if let ProvenancedOptionValue::DefaultValue(OptionValue::Boolean(true)) =
                     child_features_fn(opt, &None)
                 {
-                    if value {
-                        gather_builtin_features_recursively(
-                            child_feature,
-                            features,
-                            builtin_features,
-                            opt,
-                        );
-                    }
+                    gather_builtin_features_recursively(
+                        child_feature,
+                        features,
+                        builtin_features,
+                        opt,
+                    );
                 }
             }
         }
@@ -535,8 +535,7 @@ impl FromStr for cli::InspectRawLines {
             "false" => Ok(Self::False),
             _ => {
                 fatal(format!(
-                    r#"Invalid value for inspect-raw-lines option: {}. Valid values are "true", and "false"."#,
-                    s
+                    r#"Invalid value for inspect-raw-lines option: {s}. Valid values are "true", and "false"."#,
                 ));
             }
         }
@@ -550,8 +549,7 @@ fn parse_paging_mode(paging_mode_string: &str) -> PagingMode {
         "auto" => PagingMode::QuitIfOneScreen,
         _ => {
             fatal(format!(
-                "Invalid value for --paging option: {} (valid values are \"always\", \"never\", and \"auto\")",
-                paging_mode_string
+                "Invalid value for --paging option: {paging_mode_string} (valid values are \"always\", \"never\", and \"auto\")",
             ));
         }
     }
@@ -570,16 +568,11 @@ fn parse_width_specifier(width_arg: &str, terminal_width: usize) -> Result<usize
         .map_err(|_| {
             let pos = if must_be_negative { " negative" } else { "n" };
             let subexpr = if subexpression {
-                format!(" (from {:?})", width_arg)
+                format!(" (from {width_arg:?})")
             } else {
                 "".into()
             };
-            format!(
-                "{:?}{subexpr} is not a{pos} integer",
-                width,
-                subexpr = subexpr,
-                pos = pos
-            )
+            format!("{width:?}{subexpr} is not a{pos} integer")
         })
     };
 
@@ -599,7 +592,7 @@ fn parse_width_specifier(width_arg: &str, terminal_width: usize) -> Result<usize
             let b = parse(&width_arg[index..], true, true)?;
             (a + b)
                 .try_into()
-                .map_err(|_| format!("expression {:?} is not positive", width_arg))?
+                .map_err(|_| format!("expression {width_arg:?} is not positive"))?
         }
     };
 
@@ -612,14 +605,15 @@ fn set_widths_and_isatty(opt: &mut cli::Opt) {
 
     // If one extra character for e.g. `less --status-column` is required use "-1"
     // as an argument, also see #41, #10, #115 and #727.
-    opt.computed.available_terminal_width = term_stdout.size().1 as usize;
+    opt.computed.available_terminal_width =
+        crate::utils::workarounds::windows_msys2_width_fix(term_stdout.size(), &term_stdout);
 
     let (decorations_width, background_color_extends_to_terminal_width) = match opt.width.as_deref()
     {
         Some("variable") => (cli::Width::Variable, false),
         Some(width) => {
             let width = parse_width_specifier(width, opt.computed.available_terminal_width)
-                .unwrap_or_else(|err| fatal(format!("Invalid value for width: {}", err)));
+                .unwrap_or_else(|err| fatal(format!("Invalid value for width: {err}")));
             (cli::Width::Fixed(width), true)
         }
         None => (
@@ -644,7 +638,7 @@ fn set_true_color(opt: &mut cli::Opt) {
     opt.computed.true_color = match opt.true_color.as_ref() {
         "always" => true,
         "never" => false,
-        "auto" => is_truecolor_terminal(),
+        "auto" => is_truecolor_terminal(&opt.env),
         _ => {
             fatal(format!(
                 "Invalid value for --true-color option: {} (valid values are \"always\", \"never\", and \"auto\")",
@@ -654,28 +648,11 @@ fn set_true_color(opt: &mut cli::Opt) {
     };
 }
 
-fn is_truecolor_terminal() -> bool {
-    env::get_env_var("COLORTERM")
+fn is_truecolor_terminal(env: &DeltaEnv) -> bool {
+    env.colorterm
+        .as_ref()
         .map(|colorterm| colorterm == "truecolor" || colorterm == "24bit")
         .unwrap_or(false)
-}
-
-fn set_git_config_entries(opt: &mut cli::Opt, git_config: &mut GitConfig) {
-    for key in &["color.diff.old", "color.diff.new"] {
-        if let Some(style_string) = git_config.get::<String>(key) {
-            opt.git_config_entries
-                .insert(key.to_string(), GitConfigEntry::Style(style_string));
-        }
-    }
-
-    if let Some(repo) = &git_config.repo {
-        if let Some(workdir) = repo.workdir() {
-            opt.git_config_entries.insert(
-                "delta.__workdir__".to_string(),
-                GitConfigEntry::Path(workdir.to_path_buf()),
-            );
-        }
-    }
 }
 
 #[cfg(test)]
@@ -786,7 +763,7 @@ pub mod tests {
         assert_eq!(opt.line_numbers_right_format, "xxxyyyzzz");
         assert_eq!(opt.line_numbers_right_style, "black black");
         assert_eq!(opt.line_numbers_zero_style, "black black");
-        assert_eq!(opt.max_line_distance, 77 as f64);
+        assert_eq!(opt.max_line_distance, 77.0);
         assert_eq!(opt.max_line_length, 77);
         assert_eq!(opt.minus_emph_style, "black black");
         assert_eq!(opt.minus_empty_line_marker_style, "black black");

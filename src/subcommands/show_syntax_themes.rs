@@ -1,26 +1,27 @@
-use std::io::{self, ErrorKind, Read, Write};
-
-use structopt::StructOpt;
-
 use crate::cli;
 use crate::config;
 use crate::delta;
+use crate::env::DeltaEnv;
 use crate::options::theme::is_light_syntax_theme;
-use crate::utils::bat::assets::HighlightingAssets;
+use crate::utils;
 use crate::utils::bat::output::{OutputType, PagingMode};
+use clap::Parser;
+use std::io::{self, ErrorKind, IsTerminal, Read, Write};
 
 #[cfg(not(tarpaulin_include))]
 pub fn show_syntax_themes() -> std::io::Result<()> {
-    let assets = HighlightingAssets::new();
+    let env = DeltaEnv::default();
+    let assets = utils::bat::assets::load_highlighting_assets();
     let mut output_type = OutputType::from_mode(
+        &env,
         PagingMode::QuitIfOneScreen,
         None,
-        &config::Config::from(cli::Opt::from_args()),
+        &config::Config::from(cli::Opt::parse()),
     )
     .unwrap();
     let mut writer = output_type.handle().unwrap();
 
-    let stdin_data = if !atty::is(atty::Stream::Stdin) {
+    let stdin_data = if !io::stdin().is_terminal() {
         let mut buf = Vec::new();
         io::stdin().lock().read_to_end(&mut buf)?;
         if !buf.is_empty() {
@@ -33,8 +34,8 @@ pub fn show_syntax_themes() -> std::io::Result<()> {
     };
 
     let make_opt = || {
-        let mut opt = cli::Opt::from_args();
-        opt.computed.syntax_set = assets.syntax_set.clone();
+        let mut opt = cli::Opt::parse();
+        opt.computed.syntax_set = assets.get_syntax_set().unwrap().clone();
         opt
     };
     let opt = make_opt();
@@ -82,27 +83,24 @@ index f38589a..0f1bb83 100644
     opt.computed.is_light_mode = is_light_mode;
     let mut config = config::Config::from(opt);
     let title_style = ansi_term::Style::new().bold();
-    let assets = HighlightingAssets::new();
+    let assets = utils::bat::assets::load_highlighting_assets();
 
     for syntax_theme in assets
-        .theme_set
-        .themes
-        .iter()
-        .filter(|(t, _)| is_light_syntax_theme(t) == is_light_mode)
-        .map(|(t, _)| t)
+        .themes()
+        .filter(|t| is_light_syntax_theme(t) == is_light_mode)
     {
         writeln!(
             writer,
             "\n\nSyntax theme: {}\n",
             title_style.paint(syntax_theme)
         )?;
-        config.syntax_theme = Some(assets.theme_set.themes[syntax_theme.as_str()].clone());
+        config.syntax_theme = Some(assets.get_theme(syntax_theme).clone());
         if let Err(error) =
             delta::delta(ByteLines::new(BufReader::new(&input[0..])), writer, &config)
         {
             match error.kind() {
                 ErrorKind::BrokenPipe => std::process::exit(0),
-                _ => eprintln!("{}", error),
+                _ => eprintln!("{error}"),
             }
         };
     }
@@ -111,7 +109,7 @@ index f38589a..0f1bb83 100644
 
 #[cfg(test)]
 mod tests {
-    use std::io::{Cursor, Seek, SeekFrom};
+    use std::io::{Cursor, Seek};
 
     use super::*;
     use crate::ansi;
@@ -125,11 +123,11 @@ mod tests {
         let mut writer = Cursor::new(vec![0; 1024]);
         _show_syntax_themes(opt, true, &mut writer, None).unwrap();
         let mut s = String::new();
-        writer.seek(SeekFrom::Start(0)).unwrap();
+        writer.rewind().unwrap();
         writer.read_to_string(&mut s).unwrap();
         let s = ansi::strip_ansi_codes(&s);
         assert!(s.contains("\nSyntax theme: gruvbox-light\n"));
-        println!("{}", s);
+        println!("{s}");
         assert!(s.contains("\nfn print_cube(num: f64) {\n"));
     }
 }

@@ -77,7 +77,7 @@ pub fn copy_less_hist_file_and_append_navigate_regex(config: &Config) -> std::io
         initial_contents
     };
     if !contents.ends_with(".search\n") {
-        contents = format!("{}.search\n", contents);
+        contents = format!("{contents}.search\n");
     }
     writeln!(
         std::fs::File::create(&delta_less_hist_file)?,
@@ -90,7 +90,7 @@ pub fn copy_less_hist_file_and_append_navigate_regex(config: &Config) -> std::io
 
 #[cfg(target_os = "windows")]
 fn get_delta_less_hist_file() -> std::io::Result<PathBuf> {
-    let mut path = dirs_next::data_local_dir()
+    let mut path = dirs::data_local_dir()
         .ok_or_else(|| Error::new(ErrorKind::NotFound, "Can't find AppData\\Local folder"))?;
     path.push("delta");
     std::fs::create_dir_all(&path)?;
@@ -113,7 +113,7 @@ fn get_delta_less_hist_file() -> std::io::Result<PathBuf> {
 //        "$HOME/lesshst.ini" or "$INIT/lesshst.ini" on OS/2
 //        systems.
 fn get_less_hist_file() -> Option<PathBuf> {
-    if let Some(home_dir) = dirs_next::home_dir() {
+    if let Some(home_dir) = dirs::home_dir() {
         match std::env::var("LESSHISTFILE").as_deref() {
             Ok("-") | Ok("/dev/null") => {
                 // The user has explicitly disabled less history.
@@ -146,13 +146,13 @@ mod tests {
     use crate::tests::integration_test_utils;
 
     #[test]
-    fn test_navigate_with_overriden_key_in_main_section() {
+    fn test_navigate_with_overridden_key_in_main_section() {
         let git_config_contents = b"
 [delta]
     features = navigate
     file-modified-label = \"modified: \"
 ";
-        let git_config_path = "delta__test_navigate_with_overriden_key_in_main_section.gitconfig";
+        let git_config_path = "delta__test_navigate_with_overridden_key_in_main_section.gitconfig";
 
         assert_eq!(
             integration_test_utils::make_options_from_args_and_git_config(&[], None, None)
@@ -191,7 +191,7 @@ mod tests {
     }
 
     #[test]
-    fn test_navigate_with_overriden_key_in_custom_navigate_section() {
+    fn test_navigate_with_overridden_key_in_custom_navigate_section() {
         let git_config_contents = b"
 [delta]
     features = navigate
@@ -200,7 +200,7 @@ mod tests {
     file-modified-label = \"modified: \"
 ";
         let git_config_path =
-            "delta__test_navigate_with_overriden_key_in_custom_navigate_section.gitconfig";
+            "delta__test_navigate_with_overridden_key_in_custom_navigate_section.gitconfig";
 
         assert_eq!(
             integration_test_utils::make_options_from_args_and_git_config(&[], None, None)

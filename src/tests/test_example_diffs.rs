@@ -17,7 +17,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // #128
     fn test_added_empty_file() {
         DeltaTest::with_args(&[])
             .with_input(ADDED_EMPTY_FILE)
@@ -61,7 +60,7 @@ mod tests {
         // In addition to the background color, the code has language syntax highlighting.
         let config = integration_test_utils::make_config_from_args(&[]);
         let output = integration_test_utils::get_line_of_code_from_delta(
-            &ADDED_FILE_INPUT,
+            ADDED_FILE_INPUT,
             14,
             "class X:",
             &config,
@@ -136,6 +135,15 @@ mod tests {
     }
 
     #[test]
+    fn test_diff_unified_concatenated() {
+        // See #1002. Line buffers were not being flushed correctly, leading to material from first
+        // file last hunk appearing at beginning of second file first hunk.
+        DeltaTest::with_args(&[])
+            .with_input(DIFF_UNIFIED_CONCATENATED)
+            .expect_contains("\nLINES.\n\n1/y 2022-03-06");
+    }
+
+    #[test]
     #[ignore] // Ideally, delta would make this test pass. See #121.
     fn test_delta_ignores_non_diff_input() {
         let config = integration_test_utils::make_config_from_args(&[]);
@@ -186,6 +194,20 @@ mod tests {
     }
 
     #[test]
+    fn test_simple_dirty_submodule_diff() {
+        DeltaTest::with_args(&["--width", "30"])
+            .with_input(SUBMODULE_DIRTY)
+            .inspect()
+            .expect_after_skip(
+                1,
+                r#"
+            some_submodule
+            ──────────────────────────────
+            ca030fd1a022..803be42ca46a"#,
+            );
+    }
+
+    #[test]
     fn test_submodule_diff_log() {
         // See etc/examples/662-submodules
         // diff.submodule = log
@@ -218,7 +240,23 @@ mod tests {
         let config = integration_test_utils::make_config_from_args(&[]);
         let output = integration_test_utils::run_delta(BINARY_FILES_DIFFER, &config);
         let output = strip_ansi_codes(&output);
-        assert!(output.contains("Binary files /dev/null and b/foo differ\n"));
+        assert!(output.contains("Binary files a/foo and b/foo differ\n"));
+    }
+
+    #[test]
+    fn test_binary_file_added() {
+        let config = integration_test_utils::make_config_from_args(&[]);
+        let output = integration_test_utils::run_delta(BINARY_FILE_ADDED, &config);
+        let output = strip_ansi_codes(&output);
+        assert!(output.contains("added: foo (binary file)\n"));
+    }
+
+    #[test]
+    fn test_binary_file_removed() {
+        let config = integration_test_utils::make_config_from_args(&[]);
+        let output = integration_test_utils::run_delta(BINARY_FILE_REMOVED, &config);
+        let output = strip_ansi_codes(&output);
+        assert!(output.contains("removed: foo (binary file)\n"));
     }
 
     #[test]
@@ -387,11 +425,6 @@ commit 94907c0f136f46dc46ffae2dc92dca9af7eb7c2e
         ]);
     }
 
-    #[test]
-    fn test_commit_style_box_ul_deprecated_options() {
-        _do_test_commit_style_box_ul(&["--commit-color", "blue", "--commit-style", "box"]);
-    }
-
     fn _do_test_commit_style_box(args: &[&str]) {
         let config = integration_test_utils::make_config_from_args(args);
         let output = integration_test_utils::run_delta(GIT_DIFF_SINGLE_HUNK, &config);
@@ -524,16 +557,6 @@ commit 94907c0f136f46dc46ffae2dc92dca9af7eb7c2e │
             "yellow",
             "--commit-decoration-style",
             "yellow underline",
-        ]);
-    }
-
-    #[test]
-    fn test_commit_style_underline_deprecated_options() {
-        _do_test_commit_style_underline(&[
-            "--commit-color",
-            "yellow",
-            "--commit-style",
-            "underline",
         ]);
     }
 
@@ -704,11 +727,6 @@ src/align.rs
         ]);
     }
 
-    #[test]
-    fn test_file_style_box_ul_deprecated_options() {
-        _do_test_file_style_box_ul(&["--file-color", "green", "--file-style", "box"]);
-    }
-
     fn _do_test_file_style_box(args: &[&str]) {
         let config = integration_test_utils::make_config_from_args(args);
         let output = integration_test_utils::run_delta(GIT_DIFF_SINGLE_HUNK, &config);
@@ -782,11 +800,6 @@ src/align.rs │
             "--file-decoration-style",
             "magenta underline",
         ]);
-    }
-
-    #[test]
-    fn test_file_style_underline_deprecated_options() {
-        _do_test_file_style_underline(&["--file-color", "magenta", "--file-style", "underline"]);
     }
 
     fn _do_test_file_style_underline(args: &[&str]) {
@@ -1207,11 +1220,6 @@ impl<'a> Alignment<'a> {
         ]);
     }
 
-    #[test]
-    fn test_hunk_header_style_box_deprecated_options() {
-        _do_test_hunk_header_style_box(&["--hunk-color", "white", "--hunk-style", "box"]);
-    }
-
     fn _do_test_hunk_header_style_box(args: &[&str]) {
         let config = integration_test_utils::make_config_from_args(args);
         let output = integration_test_utils::run_delta(GIT_DIFF_SINGLE_HUNK, &config);
@@ -1321,16 +1329,6 @@ src/align.rs:71: impl<'a> Alignment<'a> { │
         _do_test_hunk_header_style_underline(&[
             "--hunk-header-decoration-style",
             "black underline",
-        ]);
-    }
-
-    #[test]
-    fn test_hunk_header_style_underline_deprecated_options() {
-        _do_test_hunk_header_style_underline(&[
-            "--hunk-color",
-            "black",
-            "--hunk-style",
-            "underline",
         ]);
     }
 
@@ -1495,6 +1493,182 @@ src/align.rs:71: impl<'a> Alignment<'a> { │
     }
 
     #[test]
+    fn test_whitespace_unrelated_edit_text_error() {
+        let whitespace_error_style = "bold yellow red ul";
+        let config = integration_test_utils::make_config_from_args(&[
+            "--whitespace-error-style",
+            whitespace_error_style,
+        ]);
+        let output =
+            integration_test_utils::run_delta(DIFF_WITH_WHITESPACE_UNRELATED_EDIT_ERROR, &config);
+        ansi_test_utils::assert_line_contain_substring_style(
+            &output,
+            9,
+            "some new",
+            "    ",
+            whitespace_error_style,
+            &config,
+        );
+    }
+
+    #[test]
+    fn test_whitespace_edit_text_error() {
+        let whitespace_error_style = "bold yellow red ul";
+        let config = integration_test_utils::make_config_from_args(&[
+            "--whitespace-error-style",
+            whitespace_error_style,
+        ]);
+        let output = integration_test_utils::run_delta(DIFF_WITH_WHITESPACE_EDIT_ERROR, &config);
+        ansi_test_utils::assert_line_contain_substring_style(
+            &output,
+            9,
+            "same ",
+            "    ",
+            whitespace_error_style,
+            &config,
+        );
+    }
+
+    #[test]
+    fn test_whitespace_added_empty_line_error() {
+        let whitespace_error_style = "bold yellow red ul";
+        let config = integration_test_utils::make_config_from_args(&[
+            "--whitespace-error-style",
+            whitespace_error_style,
+        ]);
+        let output =
+            integration_test_utils::run_delta(DIFF_WITH_ADDED_WHITESPACE_EMPTY_LINE_ERROR, &config);
+        // TODO is this the first style ?
+        ansi_test_utils::assert_line_has_style(&output, 9, " ", whitespace_error_style, &config);
+        ansi_test_utils::assert_line_contain_substring_style(
+            &output,
+            9,
+            "",
+            "   ",
+            whitespace_error_style,
+            &config,
+        );
+    }
+
+    #[test]
+    fn test_whitespace_after_text_error() {
+        let whitespace_error_style = "bold yellow red ul";
+        let config = integration_test_utils::make_config_from_args(&[
+            "--whitespace-error-style",
+            whitespace_error_style,
+        ]);
+        let output =
+            integration_test_utils::run_delta(DIFF_WITH_WHITESPACE_AFTER_TEXT_ERROR, &config);
+        ansi_test_utils::assert_line_contain_substring_style(
+            &output,
+            8,
+            "foo bar",
+            "  ",
+            whitespace_error_style,
+            &config,
+        );
+        let output = integration_test_utils::run_delta(
+            DIFF_WITH_REMOVED_WHITESPACE_AFTER_TEXT_ERROR,
+            &config,
+        );
+        ansi_test_utils::assert_line_does_not_contain_substring_style(
+            &output,
+            8,
+            "foo bar",
+            whitespace_error_style,
+            &config,
+        );
+    }
+
+    #[test]
+    fn test_whitespace_complex_error() {
+        let whitespace_error_style = "bold yellow red ul";
+        let config = integration_test_utils::make_config_from_args(&[
+            "--whitespace-error-style",
+            whitespace_error_style,
+        ]);
+        let output = integration_test_utils::run_delta(DIFF_WITH_WHITESPACE_COMPLEX_ERROR, &config);
+        // `minus` line should not display whitespace error
+        ansi_test_utils::assert_line_does_not_have_style(
+            &output,
+            8,
+            "  ",
+            whitespace_error_style,
+            &config,
+        );
+        ansi_test_utils::assert_line_does_not_have_style(
+            &output,
+            9,
+            "  ",
+            whitespace_error_style,
+            &config,
+        );
+        ansi_test_utils::assert_line_does_not_contain_substring_style(
+            &output,
+            10,
+            "  foo0 ",
+            whitespace_error_style,
+            &config,
+        );
+        ansi_test_utils::assert_line_does_not_contain_substring_style(
+            &output,
+            11,
+            "  foo1 ",
+            whitespace_error_style,
+            &config,
+        );
+        ansi_test_utils::assert_line_does_not_contain_substring_style(
+            &output,
+            12,
+            "  bar  ",
+            whitespace_error_style,
+            &config,
+        );
+
+        // `plus` line should display whitespace error
+        ansi_test_utils::assert_line_contain_substring_style(
+            &output,
+            13,
+            " ",
+            " ",
+            whitespace_error_style,
+            &config,
+        );
+        ansi_test_utils::assert_line_contain_substring_style(
+            &output,
+            14,
+            "   ",
+            "   ",
+            whitespace_error_style,
+            &config,
+        );
+        ansi_test_utils::assert_line_contain_substring_style(
+            &output,
+            15,
+            "  foo0",
+            " ",
+            whitespace_error_style,
+            &config,
+        );
+        ansi_test_utils::assert_line_contain_substring_style(
+            &output,
+            16,
+            "  foo1",
+            "   ",
+            whitespace_error_style,
+            &config,
+        );
+        ansi_test_utils::assert_line_contain_substring_style(
+            &output,
+            17,
+            "  bAr",
+            "  ",
+            whitespace_error_style,
+            &config,
+        );
+    }
+
+    #[test]
     fn test_added_empty_line_is_not_whitespace_error() {
         let plus_style = "bold yellow red ul";
         let config = integration_test_utils::make_config_from_args(&[
@@ -1602,6 +1776,21 @@ src/align.rs:71: impl<'a> Alignment<'a> { │
     }
 
     #[test]
+    fn test_file_deleted_without_preimage() {
+        DeltaTest::with_args(&[])
+            .with_input(GIT_DIFF_FILE_DELETED_WITHOUT_PREIMAGE)
+            .expect_contains("removed: foo.bar");
+    }
+
+    #[test]
+    fn test_files_deleted_without_preimage() {
+        DeltaTest::with_args(&[])
+            .with_input(GIT_DIFF_FILES_DELETED_WITHOUT_PREIMAGE)
+            .expect_contains("removed: foo")
+            .expect_contains("removed: bar");
+    }
+
+    #[test]
     fn test_file_mode_change_with_diff() {
         DeltaTest::with_args(&["--navigate", "--keep-plus-minus-markers"])
             .with_input(GIT_DIFF_FILE_MODE_CHANGE_WITH_DIFF)
@@ -1621,7 +1810,7 @@ src/align.rs:71: impl<'a> Alignment<'a> { │
     fn test_hyperlinks_commit_link_format() {
         // If commit-style is not set then the commit line is handled in raw
         // mode, in which case we only format hyperlinks if output is a tty;
-        // this causes the test to fail on Github Actions, but pass locally
+        // this causes the test to fail on GitHub Actions, but pass locally
         // if output is left going to the screen.
         DeltaTest::with_args(&[
                 "--commit-style",
@@ -1641,6 +1830,13 @@ src/align.rs:71: impl<'a> Alignment<'a> { │
         DeltaTest::with_args(&[])
             .with_input(GIT_DIFF_NO_INDEX_FILENAMES_WITH_SPACES)
             .expect_contains("a b ⟶   c d\n");
+    }
+
+    #[test]
+    fn test_file_removal_in_log_output() {
+        DeltaTest::with_args(&[])
+            .with_input(GIT_LOG_FILE_REMOVAL_IN_FIRST_COMMIT)
+            .expect_after_header("#partial\n\nremoved: a");
     }
 
     const GIT_DIFF_SINGLE_HUNK: &str = "\
@@ -1915,6 +2111,27 @@ Only in b/: just_b
 +This is different from a
 ";
 
+    const DIFF_UNIFIED_CONCATENATED: &str = "\
+--- 1/x 2022-03-06 11:16:06.313403500 -0800
++++ 2/x 2022-03-06 11:18:14.083403500 -0800
+@@ -1,5 +1,5 @@
+ This
+-is
++IS
+ a
+ few
+-lines.
++LINES.
+--- 1/y 2022-03-06 11:16:44.483403500 -0800
++++ 2/y 2022-03-06 11:16:55.213403500 -0800
+@@ -1,4 +1,4 @@
+ This
+ is
+-another
++ANOTHER
+ test.
+";
+
     const NOT_A_DIFF_OUTPUT: &str = "\
 Hello world
 This is a regular file that contains:
@@ -1923,6 +2140,16 @@ This is a regular file that contains:
  Some text here
 -Some text with a minus
 +Some text with a plus
+";
+
+    const SUBMODULE_DIRTY: &str = "\
+diff --git a/some_submodule b/some_submodule
+index ca030fd1a0..803be42ca4 160000
+--- a/some_submodule
++++ b/some_submodule
+@@ -1 +1 @@
+-Subproject commit ca030fd1a02225a6fc1a834c480276d9c97a8c6f
++Subproject commit 803be42ca46af0fbc65b54a9abfb499389516939-dirty
 ";
 
     // See etc/examples/662-submodules
@@ -2030,16 +2257,41 @@ index ba28bfd..0000000
 ";
 
     const BINARY_FILES_DIFFER: &str = "
-commit ad023698217b086f1bef934be62b4523c95f64d9 (HEAD -> master)
-Author: Dan Davison <dandavison7@gmail.com>
-Date:   Wed Feb 12 08:05:53 2020 -0600
+commit 7d58b736b09788d65392cef1bf3dcc647165f7e7 (HEAD -> main)
+Author: Sondeyy <nils.boettcher@posteo.de>
+Date:   Sat Aug 5 16:22:38 2023 +0200
 
-    .
+    modified bin file
+
+diff --git a/foo b/foo
+index c9bbb35..5fc172d 100644
+Binary files a/foo and b/foo differ
+";
+
+    const BINARY_FILE_ADDED: &str = "
+commit 7d58b736b09788d65392cef1bf3dcc647165f7e7 (HEAD -> main)
+Author: Sondeyy <nils.boettcher@posteo.de>
+Date:   Sat Aug 5 16:22:38 2023 +0200
+
+    added binary file
 
 diff --git a/foo b/foo
 new file mode 100644
-index 0000000..b572921
+index c9bbb35..5fc172d 100644
 Binary files /dev/null and b/foo differ
+";
+
+    const BINARY_FILE_REMOVED: &str = "
+commit 7d58b736b09788d65392cef1bf3dcc647165f7e7 (HEAD -> main)
+Author: Sondeyy <nils.boettcher@posteo.de>
+Date:   Sat Aug 5 16:22:38 2023 +0200
+
+    removed binary file
+
+diff --git a/foo b/foo
+deleted file mode 100644
+index c9bbb35..5fc172d 100644
+Binary files a/foo and /dev/null differ
 ";
 
     const GIT_DIFF_WITH_COPIED_FILE: &str = "
@@ -2259,6 +2511,77 @@ index 8d1c8b6..8b13789 100644
 +
 ";
 
+    const DIFF_WITH_WHITESPACE_UNRELATED_EDIT_ERROR: &str = r"
+diff --git a/foo b/foo
+index 8d1c8b6..8b13789 100644
+--- a/foo
++++ b/foo
+@@ -1 +1 @@
+-some line with trailing spaces    
++some new line with trailing spaces    
+";
+
+    const DIFF_WITH_WHITESPACE_EDIT_ERROR: &str = r"
+diff --git a/foo b/foo
+index 8d1c8b6..8b13789 100644
+--- a/foo
++++ b/foo
+@@ -1 +1 @@
+-same line with different number of trailing spaces   
++same line with different number of trailing spaces    
+";
+
+    const DIFF_WITH_WHITESPACE_AFTER_TEXT_ERROR: &str = r"
+diff --git c/a i/a
+new file mode 100644
+index 0000000..8d1c8b6
+--- /dev/null
++++ i/a
+@@ -0,0 +1 @@
++foo bar  
+";
+
+    const DIFF_WITH_REMOVED_WHITESPACE_AFTER_TEXT_ERROR: &str = r"
+diff --git i/a w/a
+index 8d1c8b6..8b13789 100644
+--- i/a
++++ w/a
+@@ -1 +0,0 @@
+-foo bar  
+";
+    const DIFF_WITH_ADDED_WHITESPACE_EMPTY_LINE_ERROR: &str = r"
+diff --git a/a b/a
+index 0ec702f..8c75341 100644
+--- a/a
++++ b/a
+@@ -1,0 +1,0 @@
+-  
++   
+";
+
+    // Delta handling is different for each of theses cases:
+    //      * Only space in the line is added or partially removed
+    //      * Space after text added or partially removed
+    //      * Space in a unmodified part of the line
+    // This test regroup theses 5 cases.
+    const DIFF_WITH_WHITESPACE_COMPLEX_ERROR: &str = r"
+diff --git a/a b/a
+index 0ec702f..8c75341 100644
+--- a/a
++++ b/a
+@@ -1,5 +1,5 @@
+-  
+-  
+-  foo0  
+-  foo1  
+-  bar  
++ 
++   
++  foo0 
++  foo1   
++  bAr  
+";
+
     const DIFF_WITH_TWO_ADDED_LINES: &str = r#"
 diff --git a/example.c b/example.c
 index 386f291a..22666f79 100644
@@ -2344,6 +2667,23 @@ old mode 100700
 new mode 100644
 ";
 
+    // This output can be generated with `git diff -D`
+    const GIT_DIFF_FILE_DELETED_WITHOUT_PREIMAGE: &str = "
+diff --git a/foo.bar b/foo.bar
+deleted file mode 100644
+index e019be0..0000000
+";
+
+    // This output can be generated with `git diff -D`
+    const GIT_DIFF_FILES_DELETED_WITHOUT_PREIMAGE: &str = "
+diff --git a/foo b/foo
+deleted file mode 100644
+index e019be0..0000000
+diff --git a/bar b/bar
+deleted file mode 100644
+index e019be0..0000000
+";
+
     const GIT_DIFF_FILE_MODE_CHANGE_WITH_DIFF: &str = "
 diff --git a/src/script b/src/script
 old mode 100644
@@ -2364,5 +2704,27 @@ index d00491f..0cfbf08 100644
 @@ -1 +1 @@
 -1
 +2
+";
+
+    const GIT_LOG_FILE_REMOVAL_IN_FIRST_COMMIT: &str = "
+commit 4117f616160180c0c57ea64840eadd08b7fa32a4
+Author: Björn Steinbrink <bsteinbr@gmail.com>
+Date:   Tue Jun 21 14:51:59 2022 +0200
+
+    remove file
+
+diff --git a a
+deleted file mode 100644
+index e69de29..0000000
+
+commit 190cce5dffeb9050fd6a27780f16d84b19c07dc0
+Author: Björn Steinbrink <bsteinbr@gmail.com>
+Date:   Tue Jun 21 14:48:20 2022 +0200
+
+    add file
+
+diff --git a a
+new file mode 100644
+index 0000000..e69de29
 ";
 }

@@ -20,8 +20,9 @@ pub fn strip_ansi_codes(s: &str) -> String {
 }
 
 pub fn measure_text_width(s: &str) -> usize {
-    // TODO: how should e.g. '\n' be handled?
-    strip_ansi_codes(s).width()
+    ansi_strings_iterator(s).fold(0, |acc, (element, is_ansi)| {
+        acc + if is_ansi { 0 } else { element.width() }
+    })
 }
 
 /// Truncate string such that `tail` is present as a suffix, preceded by as much of `s` as can be
@@ -34,7 +35,7 @@ pub fn measure_text_width(s: &str) -> usize {
 //
 // 3. If tail was exhausted, then contribute graphemes and ANSI escape sequences from `s` until the
 //    display_width of the result would exceed `display_width`.
-pub fn truncate_str<'a, 'b>(s: &'a str, display_width: usize, tail: &'b str) -> Cow<'a, str> {
+pub fn truncate_str<'a>(s: &'a str, display_width: usize, tail: &str) -> Cow<'a, str> {
     let items = ansi_strings_iterator(s).collect::<Vec<(&str, bool)>>();
     let width = strip_ansi_codes_from_strings_iterator(items.iter().copied()).width();
     if width <= display_width {
@@ -52,6 +53,7 @@ pub fn truncate_str<'a, 'b>(s: &'a str, display_width: usize, tail: &'b str) -> 
             for g in t.graphemes(true) {
                 let w = g.width();
                 if used + w > display_width {
+                    result.push_str(&" ".repeat(display_width.saturating_sub(used)));
                     break;
                 }
                 result.push_str(g);
@@ -62,7 +64,7 @@ pub fn truncate_str<'a, 'b>(s: &'a str, display_width: usize, tail: &'b str) -> 
         }
     }
 
-    Cow::from(format!("{}{}", result, result_tail))
+    Cow::from(format!("{result}{result_tail}"))
 }
 
 pub fn parse_style_sections(s: &str) -> Vec<(ansi_term::Style, &str)> {
@@ -71,7 +73,7 @@ pub fn parse_style_sections(s: &str) -> Vec<(ansi_term::Style, &str)> {
     for element in AnsiElementIterator::new(s) {
         match element {
             Element::Text(start, end) => sections.push((curr_style, &s[start..end])),
-            Element::Csi(style, _, _) => curr_style = style,
+            Element::Sgr(style, _, _) => curr_style = style,
             _ => {}
         }
     }
@@ -81,7 +83,7 @@ pub fn parse_style_sections(s: &str) -> Vec<(ansi_term::Style, &str)> {
 // Return the first CSI element, if any, as an `ansi_term::Style`.
 pub fn parse_first_style(s: &str) -> Option<ansi_term::Style> {
     AnsiElementIterator::new(s).find_map(|el| match el {
-        Element::Csi(style, _, _) => Some(style),
+        Element::Sgr(style, _, _) => Some(style),
         _ => None,
     })
 }
@@ -89,7 +91,7 @@ pub fn parse_first_style(s: &str) -> Option<ansi_term::Style> {
 pub fn string_starts_with_ansi_style_sequence(s: &str) -> bool {
     AnsiElementIterator::new(s)
         .next()
-        .map(|el| matches!(el, Element::Csi(_, _, _)))
+        .map(|el| matches!(el, Element::Sgr(_, _, _)))
         .unwrap_or(false)
 }
 
@@ -101,7 +103,8 @@ pub fn ansi_preserving_slice(s: &str, start: usize) -> String {
         .scan(0, |index, element| {
             // `index` is the index in non-ANSI-escape-sequence content.
             Some(match element {
-                Element::Csi(_, a, b) => &s[a..b],
+                Element::Sgr(_, a, b) => &s[a..b],
+                Element::Csi(a, b) => &s[a..b],
                 Element::Esc(a, b) => &s[a..b],
                 Element::Osc(a, b) => &s[a..b],
                 Element::Text(a, b) => {
@@ -140,7 +143,8 @@ pub fn ansi_preserving_index(s: &str, i: usize) -> Option<usize> {
 
 fn ansi_strings_iterator(s: &str) -> impl Iterator<Item = (&str, bool)> {
     AnsiElementIterator::new(s).map(move |el| match el {
-        Element::Csi(_, i, j) => (&s[i..j], true),
+        Element::Sgr(_, i, j) => (&s[i..j], true),
+        Element::Csi(i, j) => (&s[i..j], true),
         Element::Esc(i, j) => (&s[i..j], true),
         Element::Osc(i, j) => (&s[i..j], true),
         Element::Text(i, j) => (&s[i..j], false),
@@ -168,7 +172,7 @@ pub fn explain_ansi(line: &str, colorful: bool) -> String {
             if colorful {
                 format!("({}){}", style.to_painted_string(), style.paint(s))
             } else {
-                format!("({}){}", style, s)
+                format!("({style}){s}")
             }
         })
         .collect()

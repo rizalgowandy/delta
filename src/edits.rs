@@ -90,12 +90,31 @@ where
     }
     // Emit any remaining plus lines
     for plus_line in &plus_lines[plus_index..] {
-        annotated_plus_lines.push(vec![(noop_insertions[plus_index], plus_line)]);
+        if let Some(content) = get_contents_before_trailing_whitespace(plus_line) {
+            annotated_plus_lines.push(vec![
+                (noop_insertions[plus_index], content),
+                (noop_insertions[plus_index], &plus_line[content.len()..]),
+            ]);
+        } else {
+            annotated_plus_lines.push(vec![(noop_insertions[plus_index], plus_line)]);
+        }
         line_alignment.push((None, Some(plus_index)));
         plus_index += 1;
     }
 
     (annotated_minus_lines, annotated_plus_lines, line_alignment)
+}
+
+// Return `None` if there is no trailing whitespace.
+// Return `Some(content)` where content is trimmed if there was some trailing whitespace
+fn get_contents_before_trailing_whitespace(line: &str) -> Option<&str> {
+    let content = line.trim_end();
+    // if line has a trailing newline, do not consider it as a 'trailing whitespace'
+    if !content.is_empty() && content != line.trim_end_matches('\n') {
+        Some(content)
+    } else {
+        None
+    }
 }
 
 // Return boolean arrays indicating whether each line has a homolog (is "paired").
@@ -191,23 +210,11 @@ where
         *substrings_offset += n;
         &line[old_offset..*line_offset]
     };
-    let mut minus_section = |n| {
-        get_section(
-            n,
-            &mut minus_line_offset,
-            &mut x_offset,
-            &alignment.x,
-            minus_line,
-        )
+    let mut minus_section = |n: usize, offset: &mut usize| {
+        get_section(n, &mut minus_line_offset, offset, &alignment.x, minus_line)
     };
-    let mut plus_section = |n| {
-        get_section(
-            n,
-            &mut plus_line_offset,
-            &mut y_offset,
-            &alignment.y,
-            plus_line,
-        )
+    let mut plus_section = |n: usize, offset: &mut usize| {
+        get_section(n, &mut plus_line_offset, offset, &alignment.y, plus_line)
     };
     let distance_contribution = |section: &str| UnicodeWidthStr::width(section.trim());
 
@@ -215,7 +222,7 @@ where
     for (op, n) in alignment.coalesced_operations() {
         match op {
             align::Operation::Deletion => {
-                let minus_section = minus_section(n);
+                let minus_section = minus_section(n, &mut x_offset);
                 let n_d = distance_contribution(minus_section);
                 d_denom += n_d;
                 d_numer += n_d;
@@ -223,12 +230,14 @@ where
                 minus_op_prev = deletion;
             }
             align::Operation::NoOp => {
-                let minus_section = minus_section(n);
+                let minus_section = minus_section(n, &mut x_offset);
                 let n_d = distance_contribution(minus_section);
-                d_denom += n_d;
+                d_denom += 2 * n_d;
                 let is_space = minus_section.trim().is_empty();
                 let coalesce_space_with_previous = is_space
-                    && ((minus_op_prev == deletion && plus_op_prev == insertion)
+                    && ((minus_op_prev == deletion
+                        && plus_op_prev == insertion
+                        && (x_offset < alignment.x.len() - 1 || y_offset < alignment.y.len() - 1))
                         || (minus_op_prev == noop_deletion && plus_op_prev == noop_insertion));
                 annotated_minus_line.push((
                     if coalesce_space_with_previous {
@@ -238,29 +247,24 @@ where
                     },
                     minus_section,
                 ));
-                annotated_plus_line.push((
-                    if coalesce_space_with_previous {
-                        plus_op_prev
-                    } else {
-                        noop_insertion
-                    },
-                    plus_section(n),
-                ));
+                let op = if coalesce_space_with_previous {
+                    plus_op_prev
+                } else {
+                    noop_insertion
+                };
+                let plus_section = plus_section(n, &mut y_offset);
+                if let Some(non_whitespace) = get_contents_before_trailing_whitespace(plus_section)
+                {
+                    annotated_plus_line.push((op, non_whitespace));
+                    annotated_plus_line.push((plus_op_prev, &plus_section[non_whitespace.len()..]));
+                } else {
+                    annotated_plus_line.push((op, plus_section));
+                }
                 minus_op_prev = noop_deletion;
                 plus_op_prev = noop_insertion;
             }
-            align::Operation::Substitution => {
-                let minus_section = minus_section(n);
-                let n_d = distance_contribution(minus_section);
-                d_denom += n_d;
-                d_numer += n_d;
-                annotated_minus_line.push((deletion, minus_section));
-                annotated_plus_line.push((insertion, plus_section(n)));
-                minus_op_prev = deletion;
-                plus_op_prev = insertion;
-            }
             align::Operation::Insertion => {
-                let plus_section = plus_section(n);
+                let plus_section = plus_section(n, &mut y_offset);
                 let n_d = distance_contribution(plus_section);
                 d_denom += n_d;
                 d_numer += n_d;
@@ -490,7 +494,7 @@ mod tests {
     }
 
     fn assert_tokenize(text: &str, expected_tokens: &[&str]) {
-        let actual_tokens = tokenize(text, &*DEFAULT_TOKENIZATION_REGEXP);
+        let actual_tokens = tokenize(text, &DEFAULT_TOKENIZATION_REGEXP);
         assert_eq!(text, expected_tokens.iter().join(""));
         // tokenize() guarantees that the first element of the token stream is "".
         // See comment in Alignment::new()
@@ -573,7 +577,8 @@ mod tests {
                     ],
                 ],
                 vec![vec![
-                    (PlusNoop, "á á b á á "),
+                    (PlusNoop, "á á b á á"),
+                    (PlusNoop, " "),
                     (Insertion, "c"),
                     (PlusNoop, " á á b"),
                 ]],
@@ -594,9 +599,19 @@ mod tests {
                     vec![(MinusNoop, "cccc "), (Deletion, "c"), (MinusNoop, " ccc")],
                 ],
                 vec![
-                    vec![(PlusNoop, "bbbb "), (Insertion, "!"), (PlusNoop, " bbb")],
+                    vec![
+                        (PlusNoop, "bbbb"),
+                        (PlusNoop, " "),
+                        (Insertion, "!"),
+                        (PlusNoop, " bbb"),
+                    ],
                     vec![(PlusNoop, "dddd d ddd")],
-                    vec![(PlusNoop, "cccc "), (Insertion, "!"), (PlusNoop, " ccc")],
+                    vec![
+                        (PlusNoop, "cccc"),
+                        (PlusNoop, " "),
+                        (Insertion, "!"),
+                        (PlusNoop, " ccc"),
+                    ],
                 ],
             ),
             0.66,
@@ -631,13 +646,14 @@ mod tests {
             vec!["fn coalesce_edits<'a, 'b, EditOperation>("],
             (
                 vec![vec![
-                    (MinusNoop, "fn coalesce_edits<'a"),
-                    (MinusNoop, ", EditOperation>("),
+                    (MinusNoop, "fn coalesce_edits<'a, "),
+                    (MinusNoop, "EditOperation>("),
                 ]],
                 vec![vec![
-                    (PlusNoop, "fn coalesce_edits<'a"),
-                    (Insertion, ", 'b"),
-                    (PlusNoop, ", EditOperation>("),
+                    (PlusNoop, "fn coalesce_edits<'a,"),
+                    (PlusNoop, " "),
+                    (Insertion, "'b, "),
+                    (PlusNoop, "EditOperation>("),
                 ]],
             ),
             0.66,
@@ -652,15 +668,16 @@ mod tests {
             (
                 vec![vec![
                     (MinusNoop, "for _ in range(0, "),
-                    (MinusNoop, "options[\"count\"]"),
-                    (MinusNoop, "):"),
+                    (MinusNoop, "options[\"count\"])"),
+                    (MinusNoop, ":"),
                 ]],
                 vec![vec![
-                    (PlusNoop, "for _ in range(0, "),
+                    (PlusNoop, "for _ in range(0,"),
+                    (PlusNoop, " "),
                     (Insertion, "int("),
-                    (PlusNoop, "options[\"count\"]"),
+                    (PlusNoop, "options[\"count\"])"),
                     (Insertion, ")"),
-                    (PlusNoop, "):"),
+                    (PlusNoop, ":"),
                 ]],
             ),
             0.3,
@@ -673,8 +690,13 @@ mod tests {
             vec!["a a"],
             vec!["a b a"],
             (
-                vec![vec![(MinusNoop, "a"), (MinusNoop, " a")]],
-                vec![vec![(PlusNoop, "a"), (Insertion, " b"), (PlusNoop, " a")]],
+                vec![vec![(MinusNoop, "a "), (MinusNoop, "a")]],
+                vec![vec![
+                    (PlusNoop, "a"),
+                    (PlusNoop, " "),
+                    (Insertion, "b "),
+                    (PlusNoop, "a"),
+                ]],
             ),
             1.0,
         );
@@ -682,8 +704,13 @@ mod tests {
             vec!["a a"],
             vec!["a b b a"],
             (
-                vec![vec![(MinusNoop, "a"), (MinusNoop, " a")]],
-                vec![vec![(PlusNoop, "a"), (Insertion, " b b"), (PlusNoop, " a")]],
+                vec![vec![(MinusNoop, "a "), (MinusNoop, "a")]],
+                vec![vec![
+                    (PlusNoop, "a"),
+                    (PlusNoop, " "),
+                    (Insertion, "b b "),
+                    (PlusNoop, "a"),
+                ]],
             ),
             1.0,
         );
@@ -698,20 +725,18 @@ mod tests {
                 // TODO: Coalesce runs of the same operation.
                 vec![vec![
                     (MinusNoop, "so it is safe to read "),
-                    (Deletion, "the"),
+                    (Deletion, "the commit"),
                     (Deletion, " "),
-                    (Deletion, "commit"),
-                    (Deletion, " "),
-                    (Deletion, "number "),
-                    (MinusNoop, "from any one of them."),
+                    (Deletion, "number"),
+                    (MinusNoop, " from any one of them."),
                 ]],
                 vec![vec![
-                    (PlusNoop, "so it is safe to read "),
+                    (PlusNoop, "so it is safe to read"),
+                    (PlusNoop, " "),
                     (Insertion, "build"),
                     (Insertion, " "),
                     (Insertion, "info"),
-                    (Insertion, " "),
-                    (PlusNoop, "from any one of them."),
+                    (PlusNoop, " from any one of them."),
                 ]],
             ),
             1.0,
@@ -735,7 +760,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore]
     fn test_infer_edits_12() {
         assert_edits(
             vec!["                     (xxxxxxxxx, \"build info\"),"],
@@ -749,6 +773,122 @@ mod tests {
                 vec![vec![
                     (PlusNoop, "                     (xxxxxxxxx, \"build"),
                     (PlusNoop, "\"),"),
+                ]],
+            ),
+            1.0,
+        );
+    }
+
+    #[test]
+    fn test_infer_edits_13() {
+        assert_paired_edits(
+            vec!["'b '", "[element,]"],
+            vec!["' b'", "[element],"],
+            (
+                vec![
+                    vec![
+                        (MinusNoop, "'"),
+                        (Deletion, "b"),
+                        (MinusNoop, " "),
+                        (MinusNoop, "'"),
+                    ],
+                    vec![(MinusNoop, "[element"), (Deletion, ","), (MinusNoop, "]")],
+                ],
+                vec![
+                    vec![
+                        (PlusNoop, "'"),
+                        (PlusNoop, " "),
+                        (Insertion, "b"),
+                        (PlusNoop, "'"),
+                    ],
+                    vec![(PlusNoop, "[element"), (PlusNoop, "]"), (Insertion, ",")],
+                ],
+            ),
+        );
+    }
+
+    #[test]
+    fn test_infer_edits_14() {
+        assert_edits(
+            vec!["a b c d ", "p "],
+            vec!["x y c z ", "q r"],
+            (
+                vec![
+                    vec![
+                        (MinusNoop, ""),
+                        (Deletion, "a"),
+                        (Deletion, " "),
+                        (Deletion, "b"),
+                        (MinusNoop, " c "),
+                        (Deletion, "d"),
+                        (MinusNoop, " "),
+                    ],
+                    vec![(MinusNoop, ""), (Deletion, "p"), (Deletion, " ")],
+                ],
+                vec![
+                    vec![
+                        (PlusNoop, ""),
+                        (Insertion, "x"),
+                        (Insertion, " "),
+                        (Insertion, "y"),
+                        (PlusNoop, " c"),
+                        (Insertion, " "),
+                        (Insertion, "z"),
+                        (PlusNoop, " "),
+                    ],
+                    vec![
+                        (PlusNoop, ""),
+                        (Insertion, "q"),
+                        (Insertion, " "),
+                        (Insertion, "r"),
+                    ],
+                ],
+            ),
+            1.0,
+        );
+    }
+
+    #[test]
+    fn test_infer_edits_15() {
+        assert_paired_edits(
+            vec![r#"printf "%s\n" s y y | git add -p &&"#],
+            vec!["test_write_lines s y y | git add -p &&"],
+            (
+                vec![vec![
+                    (MinusNoop, ""),
+                    (Deletion, r#"printf "%s\n""#),
+                    (MinusNoop, " s y y | git add -p &&"),
+                ]],
+                vec![vec![
+                    (PlusNoop, ""),
+                    (Insertion, "test_write_lines"),
+                    (PlusNoop, " s y y | git add -p &&"),
+                ]],
+            ),
+        );
+    }
+
+    #[test]
+    fn test_infer_edits_16() {
+        assert_edits(
+            vec!["a a a a a a b b b"],
+            vec!["c a a a a a a c c"],
+            (
+                vec![vec![
+                    (MinusNoop, ""),
+                    (MinusNoop, "a a a a a a "),
+                    (Deletion, "b b"),
+                    (Deletion, " "),
+                    (Deletion, "b"),
+                ]],
+                vec![vec![
+                    (PlusNoop, ""),
+                    (Insertion, "c "),
+                    (PlusNoop, "a a a a a a"),
+                    (Insertion, " "),
+                    (Insertion, "c"),
+                    (Insertion, " "),
+                    (Insertion, "c"),
                 ]],
             ),
             1.0,
@@ -772,7 +912,7 @@ mod tests {
             Deletion,
             noop_insertions,
             Insertion,
-            &*DEFAULT_TOKENIZATION_REGEXP,
+            &DEFAULT_TOKENIZATION_REGEXP,
             max_line_distance,
             0.0,
         );

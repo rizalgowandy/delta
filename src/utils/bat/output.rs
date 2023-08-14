@@ -1,7 +1,6 @@
 // https://github.com/sharkdp/bat a1b9334a44a2c652f52dddaa83dbacba57372468
 // src/output.rs
 // See src/utils/bat/LICENSE
-use std::env;
 use std::ffi::OsString;
 use std::io::{self, Write};
 use std::path::PathBuf;
@@ -10,14 +9,16 @@ use std::process::{Child, Command, Stdio};
 use super::less::retrieve_less_version;
 
 use crate::config;
+use crate::env::DeltaEnv;
 use crate::fatal;
 use crate::features::navigate;
 
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 #[allow(dead_code)]
 pub enum PagingMode {
     Always,
     QuitIfOneScreen,
+    #[default]
     Never,
 }
 use crate::errors::*;
@@ -29,34 +30,31 @@ pub enum OutputType {
 
 impl OutputType {
     pub fn from_mode(
+        env: &DeltaEnv,
         mode: PagingMode,
         pager: Option<String>,
         config: &config::Config,
     ) -> Result<Self> {
         use self::PagingMode::*;
         Ok(match mode {
-            Always => OutputType::try_pager(false, pager, config)?,
-            QuitIfOneScreen => OutputType::try_pager(true, pager, config)?,
+            Always => OutputType::try_pager(env, false, pager, config)?,
+            QuitIfOneScreen => OutputType::try_pager(env, true, pager, config)?,
             _ => OutputType::stdout(),
         })
     }
 
     /// Try to launch the pager. Fall back to stdout in case of errors.
     fn try_pager(
+        env: &DeltaEnv,
         quit_if_one_screen: bool,
         pager_from_config: Option<String>,
         config: &config::Config,
     ) -> Result<Self> {
         let mut replace_arguments_to_less = false;
 
-        let pager_from_env = match (
-            env::var("DELTA_PAGER"),
-            env::var("BAT_PAGER"),
-            env::var("PAGER"),
-        ) {
-            (Ok(delta_pager), _, _) => Some(delta_pager),
-            (_, Ok(bat_pager), _) => Some(bat_pager),
-            (_, _, Ok(pager)) => {
+        let pager_from_env = match env.pagers.clone() {
+            (Some(delta_pager), _) => Some(delta_pager),
+            (_, Some(pager)) => {
                 // less needs to be called with the '-R' option in order to properly interpret ANSI
                 // color sequences. If someone has set PAGER="less -F", we therefore need to
                 // overwrite the arguments and add '-R'.
@@ -75,8 +73,7 @@ impl OutputType {
             .or(pager_from_env)
             .unwrap_or_else(|| String::from("less"));
 
-        let pagerflags =
-            shell_words::split(&pager).chain_err(|| "Could not parse pager command.")?;
+        let pagerflags = shell_words::split(&pager).context("Could not parse pager command.")?;
 
         Ok(match pagerflags.split_first() {
             Some((pager_name, args)) => {
@@ -118,7 +115,7 @@ impl OutputType {
             OutputType::Pager(ref mut command) => command
                 .stdin
                 .as_mut()
-                .chain_err(|| "Could not open stdin for pager")?,
+                .context("Could not open stdin for pager")?,
             OutputType::Stdout(ref mut handle) => handle,
         })
     }
@@ -132,7 +129,7 @@ fn _make_process_from_less_path(
     config: &config::Config,
 ) -> Option<Command> {
     if let Ok(less_path) = grep_cli::resolve_binary(less_path) {
-        let mut p = Command::new(&less_path);
+        let mut p = Command::new(less_path);
         if args.is_empty() || replace_arguments_to_less {
             p.args(vec!["--RAW-CONTROL-CHARS"]);
 
@@ -186,7 +183,7 @@ delta is not an appropriate value for $PAGER \
         );
     }
     if let Ok(pager_path) = grep_cli::resolve_binary(pager_path) {
-        let mut p = Command::new(&pager_path);
+        let mut p = Command::new(pager_path);
         p.args(args);
         Some(p)
     } else {

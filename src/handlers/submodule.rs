@@ -38,10 +38,10 @@ impl<'a> StateMachine<'a> {
                     "{}..{}",
                     self.config
                         .minus_style
-                        .paint(minus_commit.chars().take(7).collect::<String>()),
+                        .paint(minus_commit.chars().take(12).collect::<String>()),
                     self.config
                         .plus_style
-                        .paint(commit.chars().take(7).collect::<String>()),
+                        .paint(commit.chars().take(12).collect::<String>()),
                 )?;
             }
         }
@@ -51,7 +51,7 @@ impl<'a> StateMachine<'a> {
 
 lazy_static! {
     static ref SUBMODULE_SHORT_LINE_REGEX: Regex =
-        Regex::new("^[-+]Subproject commit ([0-9a-f]{40})$").unwrap();
+        Regex::new("^[-+]Subproject commit ([0-9a-f]{40})(-dirty)?$").unwrap();
 }
 
 pub fn get_submodule_short_commit(line: &str) -> Option<&str> {

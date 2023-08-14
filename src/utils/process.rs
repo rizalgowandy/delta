@@ -3,9 +3,11 @@ use std::path::Path;
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 
 use lazy_static::lazy_static;
-use sysinfo::{Pid, Process, ProcessExt, ProcessRefreshKind, SystemExt};
+use sysinfo::{Pid, PidExt, Process, ProcessExt, ProcessRefreshKind, SystemExt};
 
-#[derive(Clone, Debug, PartialEq)]
+pub type DeltaPid = u32;
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum CallingProcess {
     GitDiff(CommandLine),
     GitShow(CommandLine, Option<String>), // element 2 is file extension
@@ -18,7 +20,19 @@ pub enum CallingProcess {
 }
 // TODO: Git blame is currently handled differently
 
-#[derive(Clone, Debug, PartialEq)]
+impl CallingProcess {
+    pub fn paths_in_input_are_relative_to_cwd(&self) -> bool {
+        match self {
+            CallingProcess::GitDiff(cmd) if cmd.long_options.contains("--relative") => true,
+            CallingProcess::GitShow(cmd, _) if cmd.long_options.contains("--relative") => true,
+            CallingProcess::GitLog(cmd) if cmd.long_options.contains("--relative") => true,
+            CallingProcess::GitGrep(_) | CallingProcess::OtherGrep => true,
+            _ => false,
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CommandLine {
     pub long_options: HashSet<String>,
     pub short_options: HashSet<String>,
@@ -86,7 +100,7 @@ fn determine_calling_process() -> CallingProcess {
 
 // Return value of `extract_args(args: &[String]) -> ProcessArgs<T>` function which is
 // passed to `calling_process_cmdline()`.
-#[derive(Debug, PartialEq)]
+#[derive(Debug, PartialEq, Eq)]
 pub enum ProcessArgs<T> {
     // A result has been successfully extracted from args.
     Args(T),
@@ -250,7 +264,7 @@ fn parse_command_line<'a>(args: impl Iterator<Item = &'a str>) -> CommandLine {
         } else if s.starts_with("--") {
             long_options.insert(s.split('=').next().unwrap().to_owned());
         } else if let Some(suffix) = s.strip_prefix('-') {
-            short_options.extend(suffix.chars().map(|c| format!("-{}", c)));
+            short_options.extend(suffix.chars().map(|c| format!("-{c}")));
         } else {
             last_arg = Some(s);
         }
@@ -283,7 +297,8 @@ impl ProcInfo {
 
 trait ProcActions {
     fn cmd(&self) -> &[String];
-    fn parent(&self) -> Option<Pid>;
+    fn parent(&self) -> Option<DeltaPid>;
+    fn pid(&self) -> DeltaPid;
     fn start_time(&self) -> u64;
 }
 
@@ -294,8 +309,11 @@ where
     fn cmd(&self) -> &[String] {
         ProcessExt::cmd(self)
     }
-    fn parent(&self) -> Option<Pid> {
-        ProcessExt::parent(self)
+    fn parent(&self) -> Option<DeltaPid> {
+        ProcessExt::parent(self).map(|p| p.as_u32())
+    }
+    fn pid(&self) -> DeltaPid {
+        ProcessExt::pid(self).as_u32()
     }
     fn start_time(&self) -> u64 {
         ProcessExt::start_time(self)
@@ -305,26 +323,30 @@ where
 trait ProcessInterface {
     type Out: ProcActions;
 
-    fn my_pid(&self) -> Pid;
+    fn my_pid(&self) -> DeltaPid;
 
-    fn process(&self, pid: Pid) -> Option<&Self::Out>;
+    fn process(&self, pid: DeltaPid) -> Option<&Self::Out>;
     fn processes(&self) -> &HashMap<Pid, Self::Out>;
 
-    fn refresh_process(&mut self, pid: Pid) -> bool;
+    fn refresh_process(&mut self, pid: DeltaPid) -> bool;
     fn refresh_processes(&mut self);
 
-    fn parent_process(&mut self, pid: Pid) -> Option<&Self::Out> {
-        self.refresh_process(pid).then(|| ())?;
+    fn parent_process(&mut self, pid: DeltaPid) -> Option<&Self::Out> {
+        self.refresh_process(pid).then_some(())?;
         let parent_pid = self.process(pid)?.parent()?;
-        self.refresh_process(parent_pid).then(|| ())?;
+        self.refresh_process(parent_pid).then_some(())?;
         self.process(parent_pid)
     }
-    fn naive_sibling_process(&mut self, pid: Pid) -> Option<&Self::Out> {
+    fn naive_sibling_process(&mut self, pid: DeltaPid) -> Option<&Self::Out> {
         let sibling_pid = pid - 1;
-        self.refresh_process(sibling_pid).then(|| ())?;
+        self.refresh_process(sibling_pid).then_some(())?;
         self.process(sibling_pid)
     }
-    fn find_sibling_in_refreshed_processes<F, T>(&mut self, pid: Pid, extract_args: &F) -> Option<T>
+    fn find_sibling_in_refreshed_processes<F, T>(
+        &mut self,
+        pid: DeltaPid,
+        extract_args: &F,
+    ) -> Option<T>
     where
         F: Fn(&[String]) -> ProcessArgs<T>,
         Self: Sized,
@@ -349,7 +371,7 @@ trait ProcessInterface {
 
         let this_start_time = self.process(pid)?.start_time();
 
-        let mut pid_distances = HashMap::<Pid, usize>::new();
+        let mut pid_distances = HashMap::<DeltaPid, usize>::new();
         let mut collect_parent_pids = |pid, distance| {
             pid_distances.insert(pid, distance);
         };
@@ -376,7 +398,7 @@ trait ProcessInterface {
                             }
                         }
                     };
-                    iter_parents(self, pid, &mut sum_distance);
+                    iter_parents(self, pid.as_u32(), &mut sum_distance);
 
                     if length_of_process_chain == usize::MAX {
                         None
@@ -396,15 +418,15 @@ trait ProcessInterface {
 impl ProcessInterface for ProcInfo {
     type Out = Process;
 
-    fn my_pid(&self) -> Pid {
-        std::process::id() as Pid
+    fn my_pid(&self) -> DeltaPid {
+        std::process::id()
     }
-    fn refresh_process(&mut self, pid: Pid) -> bool {
+    fn refresh_process(&mut self, pid: DeltaPid) -> bool {
         self.info
-            .refresh_process_specifics(pid, ProcessRefreshKind::new())
+            .refresh_process_specifics(Pid::from_u32(pid), ProcessRefreshKind::new())
     }
-    fn process(&self, pid: Pid) -> Option<&Self::Out> {
-        self.info.process(pid)
+    fn process(&self, pid: DeltaPid) -> Option<&Self::Out> {
+        self.info.process(Pid::from_u32(pid))
     }
     fn processes(&self) -> &HashMap<Pid, Self::Out> {
         self.info.processes()
@@ -432,29 +454,41 @@ where
 
     let my_pid = info.my_pid();
 
-    // 1) Try the parent process. If delta is set as the pager in git, then git is the parent process.
-    let parent = info.parent_process(my_pid)?;
+    // 1) Try the parent process(es). If delta is set as the pager in git, then git is the parent process.
+    // If delta is started by a script check the parent's parent as well.
+    let mut current_pid = my_pid;
+    'parent_iter: for depth in [1, 2, 3] {
+        let parent = match info.parent_process(current_pid) {
+            None => {
+                break 'parent_iter;
+            }
+            Some(parent) => parent,
+        };
+        let parent_pid = parent.pid();
 
-    match extract_args(parent.cmd()) {
-        ProcessArgs::Args(result) => return Some(result),
-        ProcessArgs::ArgError => return None,
+        match extract_args(parent.cmd()) {
+            ProcessArgs::Args(result) => return Some(result),
+            ProcessArgs::ArgError => return None,
 
-        // 2) The parent process was something else, this can happen if git output is piped into delta, e.g.
-        // `git blame foo.txt | delta`. When the shell sets up the pipe it creates the two processes, the pids
-        // are usually consecutive, so check if the process with `my_pid - 1` matches.
-        ProcessArgs::OtherProcess => {
-            let sibling = info.naive_sibling_process(my_pid);
-            if let Some(proc) = sibling {
-                if let ProcessArgs::Args(result) = extract_args(proc.cmd()) {
-                    return Some(result);
+            // 2) The 1st parent process was something else, this can happen if git output is piped into delta, e.g.
+            // `git blame foo.txt | delta`. When the shell sets up the pipe it creates the two processes, the pids
+            // are usually consecutive, so naively check if the process with `my_pid - 1` matches.
+            ProcessArgs::OtherProcess if depth == 1 => {
+                let sibling = info.naive_sibling_process(current_pid);
+                if let Some(proc) = sibling {
+                    if let ProcessArgs::Args(result) = extract_args(proc.cmd()) {
+                        return Some(result);
+                    }
                 }
             }
-            // else try the fallback
+            // This check is not done for the parent's parent etc.
+            ProcessArgs::OtherProcess => {}
         }
+        current_pid = parent_pid;
     }
 
     /*
-    3) Neither parent nor direct sibling were a match.
+    3) Neither parent(s) nor the direct sibling were a match.
     The most likely case is that the input program of the pipe wrote all its data and exited before delta
     started, so no command line can be parsed. Same if the data was piped from an input file.
 
@@ -480,18 +514,34 @@ where
 
     */
 
-    let pid_range = my_pid.saturating_sub(10)..my_pid.saturating_add(20);
+    // Also `add` because `A_has_pid101 | delta_has_pid102`, but if A is a wrapper which then calls
+    // git (no `exec`), then the final pid of the git process might be 103 or greater.
+    let pid_range = my_pid.saturating_sub(10)..my_pid.saturating_add(10);
     for p in pid_range {
         // Processes which were not refreshed do not exist for sysinfo, so by selectively
         // letting it know about processes the `find_sibling..` function will only
         // consider these.
-        info.refresh_process(p);
+        if info.process(p).is_none() {
+            info.refresh_process(p);
+        }
     }
 
     match info.find_sibling_in_refreshed_processes(my_pid, &extract_args) {
         None => {
-            info.refresh_processes();
-            info.find_sibling_in_refreshed_processes(my_pid, &extract_args)
+            #[cfg(not(target_os = "linux"))]
+            let full_scan = true;
+
+            // The full scan is expensive on Linux and rarely successful, so disable it by default.
+            #[cfg(target_os = "linux")]
+            let full_scan = std::env::var("DELTA_CALLING_PROCESS_QUERY_ALL")
+                .map_or(false, |v| !["0", "false", "no"].iter().any(|&n| n == v));
+
+            if full_scan {
+                info.refresh_processes();
+                info.find_sibling_in_refreshed_processes(my_pid, &extract_args)
+            } else {
+                None
+            }
         }
         some => some,
     }
@@ -499,15 +549,15 @@ where
 
 // Walk up the process tree, calling `f` with the pid and the distance to `starting_pid`.
 // Prerequisite: `info.refresh_processes()` has been called.
-fn iter_parents<P, F>(info: &P, starting_pid: Pid, f: F)
+fn iter_parents<P, F>(info: &P, starting_pid: DeltaPid, f: F)
 where
     P: ProcessInterface,
-    F: FnMut(Pid, usize),
+    F: FnMut(DeltaPid, usize),
 {
-    fn inner_iter_parents<P, F>(info: &P, pid: Pid, mut f: F, distance: usize)
+    fn inner_iter_parents<P, F>(info: &P, pid: DeltaPid, mut f: F, distance: usize)
     where
         P: ProcessInterface,
-        F: FnMut(Pid, usize),
+        F: FnMut(u32, usize),
     {
         // Probably bad input, not a tree:
         if distance > 2000 {
@@ -548,7 +598,7 @@ pub mod tests {
     // When calling `FakeParentArgs::get()`, it can return `Some(values)` which were set earlier
     // during in the #[test]. Otherwise returns None.
     // This value can be valid once: `FakeParentArgs::once(val)`, for the entire scope:
-    // `FakeParentArgs::for_scope(val)`, or can be different values everytime `get()` is called:
+    // `FakeParentArgs::for_scope(val)`, or can be different values every time `get()` is called:
     // `FakeParentArgs::with([val1, val2, val3])`.
     // It is an error if `once` or `with` values remain unused, or are overused.
     // Note: The values are stored per-thread, so the expectation is that no thread boundaries are
@@ -696,16 +746,26 @@ pub mod tests {
         assert_eq!(guess_git_blame_filename_extension(&args), Args("".into()));
     }
 
-    #[derive(Debug, Default)]
+    #[derive(Debug)]
     struct FakeProc {
         #[allow(dead_code)]
-        pid: Pid,
+        pid: DeltaPid,
         start_time: u64,
         cmd: Vec<String>,
-        ppid: Option<Pid>,
+        ppid: Option<DeltaPid>,
+    }
+    impl Default for FakeProc {
+        fn default() -> Self {
+            Self {
+                pid: 0,
+                start_time: 0,
+                cmd: Vec::new(),
+                ppid: None,
+            }
+        }
     }
     impl FakeProc {
-        fn new(pid: Pid, start_time: u64, cmd: Vec<String>, ppid: Option<Pid>) -> Self {
+        fn new(pid: DeltaPid, start_time: u64, cmd: Vec<String>, ppid: Option<DeltaPid>) -> Self {
             FakeProc {
                 pid,
                 start_time,
@@ -719,28 +779,42 @@ pub mod tests {
         fn cmd(&self) -> &[String] {
             &self.cmd
         }
-        fn parent(&self) -> Option<Pid> {
+        fn parent(&self) -> Option<DeltaPid> {
             self.ppid
+        }
+        fn pid(&self) -> DeltaPid {
+            self.pid
         }
         fn start_time(&self) -> u64 {
             self.start_time
         }
     }
 
-    #[derive(Debug, Default)]
+    #[derive(Debug)]
     struct MockProcInfo {
-        delta_pid: Pid,
+        delta_pid: DeltaPid,
         info: HashMap<Pid, FakeProc>,
     }
+    impl Default for MockProcInfo {
+        fn default() -> Self {
+            Self {
+                delta_pid: 0,
+                info: HashMap::new(),
+            }
+        }
+    }
     impl MockProcInfo {
-        fn with(processes: &[(Pid, u64, &str, Option<Pid>)]) -> Self {
+        fn with(processes: &[(DeltaPid, u64, &str, Option<DeltaPid>)]) -> Self {
             MockProcInfo {
                 delta_pid: processes.last().map(|p| p.0).unwrap_or(1),
                 info: processes
                     .iter()
                     .map(|(pid, start_time, cmd, ppid)| {
                         let cmd_vec = cmd.split(' ').map(str::to_owned).collect();
-                        (*pid, FakeProc::new(*pid, *start_time, cmd_vec, *ppid))
+                        (
+                            Pid::from_u32(*pid),
+                            FakeProc::new(*pid, *start_time, cmd_vec, *ppid),
+                        )
                     })
                     .collect(),
             }
@@ -750,17 +824,17 @@ pub mod tests {
     impl ProcessInterface for MockProcInfo {
         type Out = FakeProc;
 
-        fn my_pid(&self) -> Pid {
+        fn my_pid(&self) -> DeltaPid {
             self.delta_pid
         }
-        fn process(&self, pid: Pid) -> Option<&Self::Out> {
-            self.info.get(&pid)
+        fn process(&self, pid: DeltaPid) -> Option<&Self::Out> {
+            self.info.get(&Pid::from_u32(pid))
         }
         fn processes(&self) -> &HashMap<Pid, Self::Out> {
             &self.info
         }
         fn refresh_processes(&mut self) {}
-        fn refresh_process(&mut self, _pid: Pid) -> bool {
+        fn refresh_process(&mut self, _pid: DeltaPid) -> bool {
             true
         }
     }
@@ -816,7 +890,7 @@ pub mod tests {
     fn test_process_testing_assert_never_used() {
         let _args = FakeParentArgs::once("never used");
 
-        // causes a panic while panicing, so can't test:
+        // causes a panic while panicking, so can't test:
         // let _args = FakeParentArgs::for_scope(&"never used");
         // let _args = FakeParentArgs::once(&"never used");
     }
@@ -865,7 +939,7 @@ pub mod tests {
             calling_process_cmdline(ProcInfo::new(), guess_git_blame_filename_extension),
             Some("once".into())
         );
-        // ignored: dropping causes a panic while panicing, so can't test
+        // ignored: dropping causes a panic while panicking, so can't test
         calling_process_cmdline(ProcInfo::new(), guess_git_blame_filename_extension);
     }
 
@@ -1096,7 +1170,7 @@ pub mod tests {
 
     #[test]
     fn test_process_calling_cmdline() {
-        // Github runs CI tests for arm under qemu where where sysinfo can not find the parent process.
+        // GitHub runs CI tests for arm under qemu where sysinfo can not find the parent process.
         if std::env::vars().any(|(key, _)| key == "CROSS_RUNNER" || key == "QEMU_LD_PREFIX") {
             return;
         }
@@ -1105,7 +1179,7 @@ pub mod tests {
         info.refresh_processes();
         let mut ppid_distance = Vec::new();
 
-        iter_parents(&info, std::process::id() as Pid, |pid, distance| {
+        iter_parents(&info, std::process::id(), |pid, distance| {
             ppid_distance.push(pid as i32);
             ppid_distance.push(distance as i32)
         });
@@ -1121,7 +1195,7 @@ pub mod tests {
         }
 
         // Tests that caller is something like "cargo test" or "cargo tarpaulin"
-        let find_test = |args: &[String]| find_calling_process(args, &["test", "tarpaulin"]);
+        let find_test = |args: &[String]| find_calling_process(args, &["t", "test", "tarpaulin"]);
         assert_eq!(calling_process_cmdline(info, find_test), Some(()));
 
         let nonsense = ppid_distance

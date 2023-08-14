@@ -3,25 +3,28 @@ use crate::color;
 use crate::colors;
 use crate::config;
 use crate::delta;
+use crate::env::DeltaEnv;
 use crate::git_config;
 use crate::paint;
 use crate::paint::BgShouldFill;
 use crate::style;
-use crate::utils::bat::assets::HighlightingAssets;
 use crate::utils::bat::output::{OutputType, PagingMode};
 
 #[cfg(not(tarpaulin_include))]
 pub fn show_colors() -> std::io::Result<()> {
-    use itertools::Itertools;
+    use crate::{delta::DiffType, utils};
 
-    use crate::delta::DiffType;
-
-    let assets = HighlightingAssets::new();
-    let opt = cli::Opt::from_args_and_git_config(git_config::GitConfig::try_create(), assets);
+    let assets = utils::bat::assets::load_highlighting_assets();
+    let env = DeltaEnv::default();
+    let opt = cli::Opt::from_args_and_git_config(
+        env.clone(),
+        git_config::GitConfig::try_create(&env),
+        assets,
+    );
     let config = config::Config::from(opt);
 
     let mut output_type =
-        OutputType::from_mode(PagingMode::QuitIfOneScreen, None, &config).unwrap();
+        OutputType::from_mode(&env, PagingMode::QuitIfOneScreen, None, &config).unwrap();
     let writer = output_type.handle().unwrap();
 
     let mut painter = paint::Painter::new(writer, &config);
@@ -33,7 +36,7 @@ pub fn show_colors() -> std::io::Result<()> {
         is_syntax_highlighted: true,
         ..style::Style::default()
     };
-    for (group, color_names) in colors::color_groups().iter().sorted() {
+    for (group, color_names) in colors::color_groups() {
         writeln!(painter.writer, "\n\n{}\n", title_style.paint(group))?;
         for (color_name, hex) in color_names {
             // Two syntax-highlighted lines without background color
@@ -51,15 +54,11 @@ pub fn show_colors() -> std::io::Result<()> {
             }
             // Two syntax-highlighted lines with background color
             let color =
-                color::parse_color(color_name, config.true_color, config.git_config.as_ref())
-                    .unwrap();
+                color::parse_color(color_name, config.true_color, config.git_config()).unwrap();
             style.ansi_term_style.background = Some(color);
             for line in [
-                &format!(
-                    r#"export function color(): string {{ return "{}" }}"#,
-                    color_name
-                ),
-                &format!(r#"export function hex(): string {{ return "{}" }}"#, hex),
+                &format!(r#"export function color(): string {{ return "{color_name}" }}"#),
+                &format!(r#"export function hex(): string {{ return "{hex}" }}"#),
             ] {
                 painter.syntax_highlight_and_paint_line(
                     line,

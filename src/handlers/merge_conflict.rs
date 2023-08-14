@@ -11,7 +11,7 @@ use crate::minusplus::MinusPlus;
 use crate::paint::{self, prepare};
 use crate::style::Style;
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum MergeConflictCommit {
     Ours,
     Ancestral,
@@ -125,7 +125,7 @@ impl<'a> StateMachine<'a> {
             self.painter.merge_conflict_lines[commit].push((line, state));
             true
         } else {
-            delta_unreachable(&format!("Invalid state: {:?}", state))
+            delta_unreachable(&format!("Invalid state: {state:?}"))
         }
     }
 

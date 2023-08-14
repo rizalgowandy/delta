@@ -1,20 +1,20 @@
-mod git_config_entry;
+mod remote;
 
-pub use git_config_entry::{GitConfigEntry, GitRemoteRepo};
+pub use remote::GitRemoteRepo;
 
+use crate::env::DeltaEnv;
 use regex::Regex;
 use std::collections::HashMap;
-use std::env;
-#[cfg(test)]
 use std::path::Path;
+use std::str::FromStr;
 
 use lazy_static::lazy_static;
 
 pub struct GitConfig {
-    pub config: git2::Config,
+    config: git2::Config,
     config_from_env_var: HashMap<String, String>,
     pub enabled: bool,
-    pub repo: Option<git2::Repository>,
+    repo: Option<git2::Repository>,
     // To make GitConfig cloneable when testing (in turn to make Config cloneable):
     #[cfg(test)]
     path: std::path::PathBuf,
@@ -37,11 +37,11 @@ impl Clone for GitConfig {
 
 impl GitConfig {
     #[cfg(not(test))]
-    pub fn try_create() -> Option<Self> {
+    pub fn try_create(env: &DeltaEnv) -> Option<Self> {
         use crate::fatal;
 
-        let repo = match std::env::current_dir() {
-            Ok(dir) => git2::Repository::discover(dir).ok(),
+        let repo = match &env.current_dir {
+            Some(dir) => git2::Repository::discover(dir).ok(),
             _ => None,
         };
         let config = match &repo {
@@ -51,11 +51,11 @@ impl GitConfig {
         match config {
             Some(mut config) => {
                 let config = config.snapshot().unwrap_or_else(|err| {
-                    fatal(format!("Failed to read git config: {}", err));
+                    fatal(format!("Failed to read git config: {err}"));
                 });
                 Some(Self {
                     config,
-                    config_from_env_var: parse_config_from_env_var(),
+                    config_from_env_var: parse_config_from_env_var(env),
                     repo,
                     enabled: true,
                 })
@@ -65,22 +65,35 @@ impl GitConfig {
     }
 
     #[cfg(test)]
-    pub fn try_create() -> Option<Self> {
+    pub fn try_create(_env: &DeltaEnv) -> Option<Self> {
         unreachable!("GitConfig::try_create() is not available when testing");
     }
 
-    #[cfg(test)]
-    pub fn from_path(path: &Path, honor_env_var: bool) -> Self {
-        Self {
-            config: git2::Config::open(path).unwrap(),
-            config_from_env_var: if honor_env_var {
-                parse_config_from_env_var()
-            } else {
-                HashMap::new()
-            },
-            repo: None,
-            enabled: true,
-            path: path.into(),
+    pub fn from_path(env: &DeltaEnv, path: &Path, honor_env_var: bool) -> Self {
+        use crate::fatal;
+
+        match git2::Config::open(path) {
+            Ok(mut config) => {
+                let config = config.snapshot().unwrap_or_else(|err| {
+                    fatal(format!("Failed to read git config: {err}"));
+                });
+
+                Self {
+                    config,
+                    config_from_env_var: if honor_env_var {
+                        parse_config_from_env_var(env)
+                    } else {
+                        HashMap::new()
+                    },
+                    repo: None,
+                    enabled: true,
+                    #[cfg(test)]
+                    path: path.into(),
+                }
+            }
+            Err(e) => {
+                fatal(format!("Failed to read git config: {}", e.message()));
+            }
         }
     }
 
@@ -94,11 +107,32 @@ impl GitConfig {
             None
         }
     }
+
+    pub fn get_remote_url(&self) -> Option<GitRemoteRepo> {
+        self.repo
+            .as_ref()?
+            .find_remote("origin")
+            .ok()?
+            .url()
+            .and_then(|url| GitRemoteRepo::from_str(url).ok())
+    }
+
+    pub fn for_each<F>(&self, regex: &str, mut f: F)
+    where
+        F: FnMut(&str, Option<&str>),
+    {
+        let mut entries = self.config.entries(Some(regex)).unwrap();
+        while let Some(entry) = entries.next() {
+            let entry = entry.unwrap();
+            let name = entry.name().unwrap();
+            f(name, entry.value());
+        }
+    }
 }
 
-fn parse_config_from_env_var() -> HashMap<String, String> {
-    if let Ok(s) = env::var("GIT_CONFIG_PARAMETERS") {
-        parse_config_from_env_var_value(&s)
+fn parse_config_from_env_var(env: &DeltaEnv) -> HashMap<String, String> {
+    if let Some(s) = &env.git_config_parameters {
+        parse_config_from_env_var_value(s)
     } else {
         HashMap::new()
     }

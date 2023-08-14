@@ -7,11 +7,9 @@ use itertools::Itertools;
 use syntect::easy::HighlightLines;
 use syntect::highlighting::Style as SyntectStyle;
 use syntect::parsing::{SyntaxReference, SyntaxSet};
-use unicode_segmentation::UnicodeSegmentation;
 
 use crate::config::{self, delta_unreachable, Config};
 use crate::delta::{DiffType, InMergeConflict, MergeParents, State};
-use crate::edits;
 use crate::features::hyperlinks;
 use crate::features::line_numbers::{self, LineNumbersData};
 use crate::features::side_by_side::ansifill;
@@ -21,6 +19,7 @@ use crate::minusplus::*;
 use crate::paint::superimpose_style_sections::superimpose_style_sections;
 use crate::style::Style;
 use crate::{ansi, style};
+use crate::{edits, utils, utils::tabs};
 
 pub type LineSections<'a, S> = Vec<(S, &'a str)>;
 
@@ -41,7 +40,7 @@ pub struct Painter<'p> {
 }
 
 // How the background of a line is filled up to the end
-#[derive(Debug, PartialEq, Clone, Copy)]
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
 pub enum BgFillMethod {
     // Fill the background with ANSI spaces if possible,
     // but might fallback to Spaces (e.g. in the left side-by-side panel),
@@ -51,7 +50,7 @@ pub enum BgFillMethod {
 }
 
 // If the background of a line extends to the end, and if configured to do so, how.
-#[derive(Debug, PartialEq, Clone, Copy)]
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
 pub enum BgShouldFill {
     With(BgFillMethod),
     No,
@@ -82,7 +81,7 @@ impl<'p> Painter<'p> {
             ))
         } else if config.side_by_side {
             // If line numbers are disabled in side-by-side then the data is still used
-            // for width calculaction and to pad odd width to even, see `UseFullPanelWidth`
+            // for width calculation and to pad odd width to even, see `UseFullPanelWidth`
             // for details.
             Some(line_numbers::LineNumbersData::empty_for_sbs(
                 panel_width_fix,
@@ -126,6 +125,9 @@ impl<'p> Painter<'p> {
     }
 
     pub fn paint_buffered_minus_and_plus_lines(&mut self) {
+        if self.minus_lines.is_empty() && self.plus_lines.is_empty() {
+            return;
+        }
         paint_minus_and_plus_lines(
             MinusPlus::new(&self.minus_lines, &self.plus_lines),
             &mut self.line_numbers_data,
@@ -227,6 +229,7 @@ impl<'p> Painter<'p> {
             } else if let Some(BgFillMethod::Spaces) = bg_fill_mode {
                 let text_width = ansi::measure_text_width(&line);
                 line.push_str(
+                    #[allow(clippy::unnecessary_to_owned)]
                     &fill_style
                         .paint(" ".repeat(config.available_terminal_width - text_width))
                         .to_string(),
@@ -257,10 +260,7 @@ impl<'p> Painter<'p> {
         state: State,
         background_color_extends_to_terminal_width: BgShouldFill,
     ) {
-        let lines = vec![(
-            expand_tabs(line.graphemes(true), self.config.tab_width),
-            state,
-        )];
+        let lines = vec![(tabs::expand(line, &self.config.tab_cfg), state)];
         let syntax_style_sections =
             get_syntax_style_sections_for_lines(&lines, self.highlighter.as_mut(), self.config);
         let diff_style_sections = match style_sections {
@@ -360,6 +360,7 @@ impl<'p> Painter<'p> {
     /// current buffer position.
     pub fn mark_empty_line(empty_line_style: &Style, line: &mut String, marker: Option<&str>) {
         line.push_str(
+            #[allow(clippy::unnecessary_to_owned)]
             &empty_line_style
                 .paint(marker.unwrap_or(ansi::ANSI_CSI_CLEAR_TO_BOL))
                 .to_string(),
@@ -460,7 +461,7 @@ impl<'p> Painter<'p> {
             }
             State::Blame(_) => true,
             State::GitShowFile => true,
-            State::Grep => true,
+            State::Grep(_, _, _, _) => true,
             State::Unknown
             | State::CommitMeta
             | State::DiffHeader(_)
@@ -517,9 +518,15 @@ impl<'p> Painter<'p> {
             let line_has_emph_and_non_emph_sections =
                 style_sections_contain_more_than_one_style(style_sections);
             let should_update_non_emph_styles = non_emph_style.is_some() && *line_has_homolog;
-            let is_whitespace_error =
-                whitespace_error_style.is_some() && is_whitespace_error(style_sections);
-            for (style, _) in style_sections.iter_mut() {
+
+            // TODO: Git recognizes blank lines at end of file (blank-at-eof)
+            // as a whitespace error but delta does not yet.
+            // https://git-scm.com/docs/git-config#Documentation/git-config.txt-corewhitespace
+            let mut is_whitespace_error = whitespace_error_style.is_some();
+            for (style, s) in style_sections.iter_mut().rev() {
+                if is_whitespace_error && !s.trim().is_empty() {
+                    is_whitespace_error = false;
+                }
                 // If the line as a whole constitutes a whitespace error then highlight this
                 // section if either (a) it is an emph section, or (b) the line lacks any
                 // emph/non-emph distinction.
@@ -532,6 +539,9 @@ impl<'p> Painter<'p> {
                 // Otherwise, update the style if this is a non-emph section that needs updating.
                 else if should_update_non_emph_styles && !style.is_emph {
                     *style = non_emph_style.unwrap();
+                    if is_whitespace_error {
+                        *style = whitespace_error_style.unwrap();
+                    }
                 }
             }
         }
@@ -547,8 +557,9 @@ pub fn prepare(line: &str, prefix_length: usize, config: &config::Config) -> Str
         // The prefix contains -/+/space characters, added by git. We removes them now so they
         // are not present during syntax highlighting or wrapping. If --keep-plus-minus-markers
         // is in effect the prefix is re-inserted in Painter::paint_line.
-        let line = line.graphemes(true).skip(prefix_length);
-        format!("{}\n", expand_tabs(line, config.tab_width))
+        let mut line = tabs::remove_prefix_and_expand(prefix_length, line, &config.tab_cfg);
+        line.push('\n');
+        line
     } else {
         "\n".to_string()
     }
@@ -557,28 +568,9 @@ pub fn prepare(line: &str, prefix_length: usize, config: &config::Config) -> Str
 // Remove initial -/+ characters, expand tabs as spaces, retaining ANSI sequences. Terminate with
 // newline character.
 pub fn prepare_raw_line(raw_line: &str, prefix_length: usize, config: &config::Config) -> String {
-    format!(
-        "{}\n",
-        ansi::ansi_preserving_slice(
-            &expand_tabs(raw_line.graphemes(true), config.tab_width),
-            prefix_length
-        ),
-    )
-}
-
-/// Expand tabs as spaces.
-/// tab_width = 0 is documented to mean do not replace tabs.
-pub fn expand_tabs<'a, I>(line: I, tab_width: usize) -> String
-where
-    I: Iterator<Item = &'a str>,
-{
-    if tab_width > 0 {
-        let tab_replacement = " ".repeat(tab_width);
-        line.map(|s| if s == "\t" { &tab_replacement } else { s })
-            .collect::<String>()
-    } else {
-        line.collect::<String>()
-    }
+    let mut line = tabs::expand(raw_line, &config.tab_cfg);
+    line.push('\n');
+    ansi::ansi_preserving_slice(&line, prefix_length)
 }
 
 pub fn paint_minus_and_plus_lines(
@@ -674,7 +666,11 @@ pub fn get_syntax_style_sections_for_lines<'a>(
     ) {
         (Some(highlighter), true) => {
             for (line, _) in lines.iter() {
-                line_sections.push(highlighter.highlight(line, &config.syntax_set));
+                line_sections.push(
+                    highlighter
+                        .highlight_line(line, &config.syntax_set)
+                        .unwrap(),
+                );
             }
         }
         _ => {
@@ -775,7 +771,7 @@ pub fn parse_style_sections<'a>(
 #[allow(clippy::too_many_arguments)]
 pub fn paint_file_path_with_line_number(
     line_number: Option<usize>,
-    plus_file: &str,
+    file_path: &str,
     pad_line_number: bool,
     separator: &str,
     terminate_with_separator: bool,
@@ -785,19 +781,19 @@ pub fn paint_file_path_with_line_number(
 ) -> String {
     let mut file_with_line_number = Vec::new();
     if let Some(file_style) = file_style {
-        let plus_file = if let Some(regex_replacement) = &config.file_regex_replacement {
-            regex_replacement.execute(plus_file)
+        let file_path = if let Some(regex_replacement) = &config.file_regex_replacement {
+            regex_replacement.execute(file_path)
         } else {
-            Cow::from(plus_file)
+            Cow::from(file_path)
         };
-        file_with_line_number.push(file_style.paint(plus_file))
+        file_with_line_number.push(file_style.paint(file_path))
     };
     if let Some(line_number) = line_number {
         if let Some(line_number_style) = line_number_style {
             if !file_with_line_number.is_empty() {
                 file_with_line_number.push(ansi_term::ANSIString::from(separator));
             }
-            file_with_line_number.push(line_number_style.paint(format!("{}", line_number)))
+            file_with_line_number.push(line_number_style.paint(format!("{line_number}")))
         }
     }
     if terminate_with_separator {
@@ -820,16 +816,19 @@ pub fn paint_file_path_with_line_number(
         }
     }
     let file_with_line_number = ansi_term::ANSIStrings(&file_with_line_number).to_string();
-    if config.hyperlinks && !file_with_line_number.is_empty() {
-        hyperlinks::format_osc8_file_hyperlink(
-            plus_file,
+    match if config.hyperlinks && !file_with_line_number.is_empty() {
+        utils::path::absolute_path(file_path, config)
+    } else {
+        None
+    } {
+        Some(absolute_path) => hyperlinks::format_osc8_file_hyperlink(
+            absolute_path,
             line_number,
             &file_with_line_number,
             config,
         )
-        .into()
-    } else {
-        file_with_line_number
+        .into(),
+        _ => file_with_line_number,
     }
 }
 
@@ -842,26 +841,6 @@ fn style_sections_contain_more_than_one_style(sections: &[(Style, &str)]) -> boo
     } else {
         false
     }
-}
-
-/// True iff the line represented by `sections` constitutes a whitespace error.
-// A line is a whitespace error iff it is non-empty and contains only whitespace
-// characters.
-// TODO: Git recognizes blank lines at end of file (blank-at-eof)
-// as a whitespace error but delta does not yet.
-// https://git-scm.com/docs/git-config#Documentation/git-config.txt-corewhitespace
-fn is_whitespace_error(sections: &[(Style, &str)]) -> bool {
-    let mut any_chars = false;
-    for c in sections.iter().flat_map(|(_, s)| s.chars()) {
-        if c == '\n' {
-            return any_chars;
-        } else if c != ' ' && c != '\t' {
-            return false;
-        } else {
-            any_chars = true;
-        }
-    }
-    false
 }
 
 mod superimpose_style_sections {

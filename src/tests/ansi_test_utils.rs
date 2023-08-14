@@ -8,6 +8,8 @@ pub mod ansi_test_utils {
     use crate::paint;
     use crate::style::Style;
 
+    // Check if `output[line_number]` start with `expected_prefix`
+    // Then check if the first style in the line is the `expected_style`
     pub fn assert_line_has_style(
         output: &str,
         line_number: usize,
@@ -23,6 +25,50 @@ pub mod ansi_test_utils {
             config,
             false,
         ));
+    }
+
+    // Check if `output[line_number]` start with `expected_prefix`
+    // Then check if it contains the `expected_substring` with the corresponding `expected_style`
+    // If the line contains multiples times the `expected_style`, will only compare with the first
+    // item found
+    pub fn assert_line_contain_substring_style(
+        output: &str,
+        line_number: usize,
+        expected_prefix: &str,
+        expected_substring: &str,
+        expected_style: &str,
+        config: &Config,
+    ) {
+        assert_eq!(
+            expected_substring,
+            _line_get_substring_matching_style(
+                output,
+                line_number,
+                expected_prefix,
+                expected_style,
+                config,
+            )
+            .unwrap()
+        );
+    }
+
+    // Check if `output[line_number]` start with `expected_prefix`
+    // Then check if the line does not contains the `expected_style`
+    pub fn assert_line_does_not_contain_substring_style(
+        output: &str,
+        line_number: usize,
+        expected_prefix: &str,
+        expected_style: &str,
+        config: &Config,
+    ) {
+        assert!(_line_get_substring_matching_style(
+            output,
+            line_number,
+            expected_prefix,
+            expected_style,
+            config,
+        )
+        .is_none());
     }
 
     pub fn assert_line_does_not_have_style(
@@ -81,7 +127,7 @@ pub mod ansi_test_utils {
     ) {
         let line = output.lines().nth(line_number).unwrap();
         let substring_end = substring_begin + expected_substring.len();
-        let substring = &ansi::strip_ansi_codes(&line)[substring_begin..substring_end];
+        let substring = &ansi::strip_ansi_codes(line)[substring_begin..substring_end];
         assert_eq!(substring, expected_substring);
         let painted_substring = paint_line(substring, language_extension, state, config);
         // remove trailing newline appended by paint::paint_lines.
@@ -103,7 +149,7 @@ pub mod ansi_test_utils {
     }
 
     pub fn get_color_variants(string: &str, config: &Config) -> (String, String) {
-        let string_without_any_color = ansi::strip_ansi_codes(string).to_string();
+        let string_without_any_color = ansi::strip_ansi_codes(string);
         let string_with_plus_color_only = config
             .plus_style
             .ansi_term_style
@@ -129,7 +175,7 @@ pub mod ansi_test_utils {
         };
         painter.set_syntax(Some(language_extension));
         painter.set_highlighter();
-        let lines = vec![(line.to_string(), state.clone())];
+        let lines = vec![(line.to_string(), state)];
         let syntax_style_sections = paint::get_syntax_style_sections_for_lines(
             &lines,
             painter.highlighter.as_mut(),
@@ -150,6 +196,30 @@ pub mod ansi_test_utils {
         output_buffer
     }
 
+    fn _line_extract<'a>(output: &'a str, line_number: usize, expected_prefix: &str) -> &'a str {
+        let line = output.lines().nth(line_number).unwrap();
+        assert!(ansi::strip_ansi_codes(line).starts_with(expected_prefix));
+        line
+    }
+
+    fn _line_get_substring_matching_style<'a>(
+        output: &'a str,
+        line_number: usize,
+        expected_prefix: &str,
+        expected_style: &str,
+        config: &Config,
+    ) -> Option<&'a str> {
+        let line = _line_extract(output, line_number, expected_prefix);
+        let style = Style::from_str(
+            expected_style,
+            None,
+            None,
+            config.true_color,
+            config.git_config.as_ref(),
+        );
+        style.get_matching_substring(line)
+    }
+
     fn _line_has_style(
         output: &str,
         line_number: usize,
@@ -158,14 +228,13 @@ pub mod ansi_test_utils {
         config: &Config,
         _4_bit_color: bool,
     ) -> bool {
-        let line = output.lines().nth(line_number).unwrap();
-        assert!(ansi::strip_ansi_codes(line).starts_with(expected_prefix));
+        let line = _line_extract(output, line_number, expected_prefix);
         let mut style = Style::from_str(
             expected_style,
             None,
             None,
             config.true_color,
-            config.git_config.as_ref(),
+            config.git_config(),
         );
         if _4_bit_color {
             style.ansi_term_style.foreground = style

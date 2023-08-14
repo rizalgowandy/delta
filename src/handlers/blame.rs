@@ -2,16 +2,27 @@ use chrono::{DateTime, FixedOffset};
 use lazy_static::lazy_static;
 use regex::Regex;
 use std::borrow::Cow;
+use unicode_width::UnicodeWidthStr;
 
 use crate::ansi::measure_text_width;
 use crate::color;
 use crate::config;
 use crate::config::delta_unreachable;
 use crate::delta::{self, State, StateMachine};
-use crate::format::{self, Placeholder};
+use crate::fatal;
+use crate::format::{self, FormatStringSimple, Placeholder};
+use crate::format::{make_placeholder_regex, parse_line_number_format};
 use crate::paint::{self, BgShouldFill, StyleSectionSpecifier};
 use crate::style::Style;
 use crate::utils;
+
+#[derive(Clone, Debug)]
+pub enum BlameLineNumbers {
+    // "none" equals a fixed string with just a separator
+    On(FormatStringSimple),
+    PerBlock(FormatStringSimple),
+    Every(usize, FormatStringSimple),
+}
 
 impl<'a> StateMachine<'a> {
     /// If this is a line of git blame output then render it accordingly. If
@@ -33,7 +44,7 @@ impl<'a> StateMachine<'a> {
                 // Format blame metadata
                 let format_data = format::parse_line_number_format(
                     &self.config.blame_format,
-                    &*BLAME_PLACEHOLDER_REGEX,
+                    &BLAME_PLACEHOLDER_REGEX,
                     false,
                 );
                 let mut formatted_blame_metadata =
@@ -49,18 +60,26 @@ impl<'a> StateMachine<'a> {
                 let code_style = self.config.blame_code_style.unwrap_or(metadata_style);
                 let separator_style = self.config.blame_separator_style.unwrap_or(code_style);
 
+                let (nr_prefix, line_number, nr_suffix) = format_blame_line_number(
+                    &self.config.blame_separator_format,
+                    blame.line_number,
+                    is_repeat,
+                );
+
                 write!(
                     self.painter.writer,
-                    "{}{}",
+                    "{}{}{}{}",
                     metadata_style.paint(&formatted_blame_metadata),
-                    separator_style.paint(&self.config.blame_separator)
+                    separator_style.paint(nr_prefix),
+                    metadata_style.paint(&line_number),
+                    separator_style.paint(nr_suffix),
                 )?;
 
                 // Emit syntax-highlighted code
                 if matches!(self.state, State::Unknown) {
                     if let Some(lang) = utils::process::git_blame_filename_extension()
                         .as_ref()
-                        .or_else(|| self.config.default_language.as_ref())
+                        .or(self.config.default_language.as_ref())
                     {
                         self.painter.set_syntax(Some(lang));
                         self.painter.set_highlighter();
@@ -100,7 +119,7 @@ impl<'a> StateMachine<'a> {
                 // borrow checker won't permit that.
                 let style = Style::from_colors(
                     None,
-                    color::parse_color(&color, true, self.config.git_config.as_ref()),
+                    color::parse_color(&color, true, self.config.git_config()),
                 );
                 self.blame_key_colors.insert(key.to_owned(), color);
                 style
@@ -232,6 +251,7 @@ pub fn parse_git_blame_line<'a>(line: &'a str, timestamp_format: &str) -> Option
 }
 
 lazy_static! {
+    // line numbers (`{n}`) change with every line and are set separately via `blame-separator-format`
     pub static ref BLAME_PLACEHOLDER_REGEX: Regex =
         format::make_placeholder_regex(&["timestamp", "author", "commit"]);
 }
@@ -246,25 +266,28 @@ pub fn format_blame_metadata(
     for placeholder in format_data {
         s.push_str(placeholder.prefix.as_str());
 
-        let alignment_spec = placeholder
-            .alignment_spec
-            .as_ref()
-            .unwrap_or(&format::Align::Left);
+        let alignment_spec = placeholder.alignment_spec.unwrap_or(format::Align::Left);
         let width = placeholder.width.unwrap_or(15);
 
         let field = match placeholder.placeholder {
-            Some(Placeholder::Str("timestamp")) => Some(Cow::from(
-                chrono_humanize::HumanTime::from(blame.time).to_string(),
-            )),
+            Some(Placeholder::Str("timestamp")) => {
+                Some(Cow::from(match &config.blame_timestamp_output_format {
+                    Some(time_format) => blame.time.format(time_format).to_string(),
+                    None => chrono_humanize::HumanTime::from(blame.time).to_string(),
+                }))
+            }
             Some(Placeholder::Str("author")) => Some(Cow::from(blame.author)),
             Some(Placeholder::Str("commit")) => Some(delta::format_raw_line(blame.commit, config)),
             None => None,
             _ => unreachable!("Unexpected `git blame` input"),
         };
         if let Some(field) = field {
+            // Unicode modifier should not be counted as character to allow a consistent padding
+            let unicode_modifier_width =
+                field.as_ref().chars().count() - UnicodeWidthStr::width(field.as_ref());
             s.push_str(&format::pad(
                 &field,
-                width,
+                width + unicode_modifier_width,
                 alignment_spec,
                 placeholder.precision,
             ))
@@ -273,6 +296,91 @@ pub fn format_blame_metadata(
     }
     s.push_str(suffix);
     s
+}
+
+pub fn format_blame_line_number(
+    format: &BlameLineNumbers,
+    line_number: usize,
+    is_repeat: bool,
+) -> (&str, String, &str) {
+    let (format, empty) = match &format {
+        BlameLineNumbers::PerBlock(format) => (format, is_repeat),
+        BlameLineNumbers::Every(n, format) => (format, is_repeat && line_number % n != 0),
+        BlameLineNumbers::On(format) => (format, false),
+    };
+    let mut result = String::new();
+
+    // depends on defaults being set when parsing arguments
+    let line_number = if format.width.is_some() {
+        format::pad(
+            line_number,
+            format.width.unwrap(),
+            format.alignment_spec.unwrap(),
+            None,
+        )
+    } else {
+        String::new()
+    };
+
+    if empty {
+        for _ in 0..measure_text_width(&line_number) {
+            result.push(' ');
+        }
+    } else {
+        result.push_str(&line_number);
+    }
+
+    (format.prefix.as_str(), result, format.suffix.as_str())
+}
+
+pub fn parse_blame_line_numbers(arg: &str) -> BlameLineNumbers {
+    if arg == "none" {
+        return BlameLineNumbers::On(crate::format::FormatStringSimple::only_string("│"));
+    }
+
+    let regex = make_placeholder_regex(&["n"]);
+    let f = match parse_line_number_format(arg, &regex, false) {
+        v if v.len() > 1 => {
+            fatal("Too many format arguments numbers for blame-line-numbers".to_string())
+        }
+        mut v => v.pop().unwrap(),
+    };
+
+    let set_defaults = |mut format: crate::format::FormatStringSimple| {
+        format.width = format.width.or(Some(4));
+        format.alignment_spec = format.alignment_spec.or(Some(crate::format::Align::Center));
+
+        format
+    };
+
+    if f.placeholder.is_none() {
+        return BlameLineNumbers::On(crate::format::FormatStringSimple::only_string(
+            f.suffix.as_str(),
+        ));
+    }
+
+    match f.fmt_type.as_str() {
+        t if t.is_empty() || t == "every" => BlameLineNumbers::On(set_defaults(f.into_simple())),
+        t if t == "block" => BlameLineNumbers::PerBlock(set_defaults(f.into_simple())),
+        every_n if every_n.starts_with("every-") => {
+            let n = every_n["every-".len()..]
+                .parse::<usize>()
+                .unwrap_or_else(|err| {
+                    fatal(format!(
+                        "Invalid number for blame-line-numbers in every-N argument: {err}",
+                    ))
+                });
+
+            if n > 1 {
+                BlameLineNumbers::Every(n, set_defaults(f.into_simple()))
+            } else {
+                BlameLineNumbers::On(set_defaults(f.into_simple()))
+            }
+        }
+        t => fatal(format!(
+            "Invalid format type \"{t}\" for blame-line-numbers",
+        )),
+    }
 }
 
 #[cfg(test)]
@@ -306,9 +414,55 @@ mod tests {
     }
 
     #[test]
+    fn test_format_blame_metadata_with_default_timestamp_output_format() {
+        let format_data = make_format_data_with_placeholder("timestamp");
+        let blame = make_blame_line_with_time("1996-12-19T16:39:57-08:00");
+        let config = integration_test_utils::make_config_from_args(&[]);
+        let regex = Regex::new(r"^\d+ years ago$").unwrap();
+        let result = format_blame_metadata(&[format_data], &blame, &config);
+        assert!(regex.is_match(result.trim()));
+    }
+
+    #[test]
+    fn test_format_blame_metadata_with_custom_timestamp_output_format() {
+        let format_data = make_format_data_with_placeholder("timestamp");
+        let blame = make_blame_line_with_time("1996-12-19T16:39:57-08:00");
+        let config = integration_test_utils::make_config_from_args(&[
+            "--blame-timestamp-output-format=%Y-%m-%d %H:%M",
+        ]);
+        let result = format_blame_metadata(&[format_data], &blame, &config);
+        assert_eq!(result.trim(), "1996-12-19 16:39");
+    }
+
+    #[test]
+    fn test_format_blame_metadata_with_accent_in_name() {
+        let config = integration_test_utils::make_config_from_args(&[]);
+
+        let count_trailing_spaces = |s: String| s.chars().rev().filter(|&c| c == ' ').count();
+
+        let format_data1 = make_format_data_with_placeholder("author");
+        let blame1 = make_blame_line_with_author("E\u{301}dith Piaf");
+        let result1 = format_blame_metadata(&[format_data1], &blame1, &config);
+
+        let format_data2 = make_format_data_with_placeholder("author");
+        let blame2 = make_blame_line_with_author("Edith Piaf");
+        let result2 = format_blame_metadata(&[format_data2], &blame2, &config);
+
+        assert_eq!(
+            count_trailing_spaces(result1),
+            count_trailing_spaces(result2)
+        );
+    }
+
+    #[test]
     fn test_color_assignment() {
         let mut writer = Cursor::new(vec![0; 512]);
-        let config = integration_test_utils::make_config_from_args(&["--blame-palette", "1 2"]);
+        let config = integration_test_utils::make_config_from_args(&[
+            "--blame-format",
+            "{author} {commit}",
+            "--blame-palette",
+            "1 2",
+        ]);
         let mut machine = StateMachine::new(&mut writer, &config);
 
         let blame_lines: HashMap<&str, &str> = vec![
@@ -333,7 +487,7 @@ mod tests {
         machine.handle_blame_line().unwrap();
         assert_eq!(
             hashmap_items(&machine.blame_key_colors),
-            &[("4 months ago    Dan Davison     aaaaaaa ", "1")]
+            &[("Dan Davison     aaaaaaa        ", "1")]
         );
 
         // Repeat key: same color
@@ -341,7 +495,7 @@ mod tests {
         machine.handle_blame_line().unwrap();
         assert_eq!(
             hashmap_items(&machine.blame_key_colors),
-            &[("4 months ago    Dan Davison     aaaaaaa ", "1")]
+            &[("Dan Davison     aaaaaaa        ", "1")]
         );
 
         // Second distinct key gets second color
@@ -350,8 +504,8 @@ mod tests {
         assert_eq!(
             hashmap_items(&machine.blame_key_colors),
             &[
-                ("4 months ago    Dan Davison     aaaaaaa ", "1"),
-                ("a year ago      Dan Davison     bbbbbbb ", "2")
+                ("Dan Davison     aaaaaaa        ", "1"),
+                ("Dan Davison     bbbbbbb        ", "2")
             ]
         );
 
@@ -361,9 +515,9 @@ mod tests {
         assert_eq!(
             hashmap_items(&machine.blame_key_colors),
             &[
-                ("4 months ago    Dan Davison     aaaaaaa ", "1"),
-                ("a year ago      Dan Davison     bbbbbbb ", "2"),
-                ("a year ago      Dan Davison     ccccccc ", "1")
+                ("Dan Davison     aaaaaaa        ", "1"),
+                ("Dan Davison     bbbbbbb        ", "2"),
+                ("Dan Davison     ccccccc        ", "1")
             ]
         );
 
@@ -375,9 +529,9 @@ mod tests {
         assert_eq!(
             hashmap_items(&machine.blame_key_colors),
             &[
-                ("4 months ago    Dan Davison     aaaaaaa ", "2"),
-                ("a year ago      Dan Davison     bbbbbbb ", "2"),
-                ("a year ago      Dan Davison     ccccccc ", "1")
+                ("Dan Davison     aaaaaaa        ", "2"),
+                ("Dan Davison     bbbbbbb        ", "2"),
+                ("Dan Davison     ccccccc        ", "1")
             ]
         );
     }
@@ -388,5 +542,33 @@ mod tests {
             .sorted()
             .map(|(k, v)| (k.as_str(), v.as_str()))
             .collect()
+    }
+
+    fn make_blame_line_with_time(timestamp: &str) -> BlameLine {
+        let time = chrono::DateTime::parse_from_rfc3339(timestamp).unwrap();
+        BlameLine {
+            commit: "",
+            author: "",
+            time,
+            line_number: 0,
+            code: "",
+        }
+    }
+
+    fn make_format_data_with_placeholder(placeholder: &str) -> format::FormatStringPlaceholderData {
+        format::FormatStringPlaceholderData {
+            placeholder: Some(Placeholder::Str(placeholder)),
+            ..Default::default()
+        }
+    }
+
+    fn make_blame_line_with_author(author: &str) -> BlameLine {
+        BlameLine {
+            commit: "",
+            author,
+            time: chrono::DateTime::default(),
+            line_number: 0,
+            code: "",
+        }
     }
 }

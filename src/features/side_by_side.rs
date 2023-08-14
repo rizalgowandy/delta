@@ -1,6 +1,6 @@
 use itertools::Itertools;
 use syntect::highlighting::Style as SyntectStyle;
-use unicode_segmentation::UnicodeSegmentation;
+use unicode_width::UnicodeWidthStr;
 
 use crate::ansi;
 use crate::cli;
@@ -60,14 +60,14 @@ pub fn available_line_width(
     config: &Config,
     data: &line_numbers::LineNumbersData,
 ) -> line_numbers::SideBySideLineWidth {
-    let linennumbers_width = data.formatted_width();
+    let line_numbers_width = data.formatted_width();
 
     // The width can be reduced by the line numbers and/or
     // a possibly added/restored 1-wide "+/-/ " prefix.
     let line_width = |side: PanelSide| {
         config.side_by_side_data[side]
             .width
-            .saturating_sub(linennumbers_width[side])
+            .saturating_sub(line_numbers_width[side])
             .saturating_sub(config.keep_plus_minus_markers as usize)
     };
 
@@ -75,12 +75,10 @@ pub fn available_line_width(
 }
 
 pub fn line_is_too_long(line: &str, line_width: usize) -> bool {
-    let line_sum = line.graphemes(true).count();
-
     debug_assert!(line.ends_with('\n'));
-    // `line_sum` is too large because a trailing newline is present,
-    // so allow one more character.
-    line_sum > line_width + 1
+
+    // graphemes will take care of newlines
+    line.width() > line_width
 }
 
 /// Return whether any of the input lines is too long, and a data
@@ -350,17 +348,17 @@ fn paint_right_panel_plus_line<'a>(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn get_right_fill_style_for_panel<'a>(
+fn get_right_fill_style_for_panel(
     line_is_empty: bool,
     line_index: Option<usize>,
-    diff_style_sections: &[LineSections<'a, Style>],
+    diff_style_sections: &[LineSections<'_, Style>],
     lines_have_homolog: Option<&[bool]>,
     state: &State,
     panel_side: PanelSide,
     background_color_extends_to_terminal_width: BgShouldFill,
     config: &Config,
 ) -> (Option<BgFillMethod>, Style) {
-    // If in the the left panel then it must be filled with spaces.
+    // If in the left panel then it must be filled with spaces.
     let none_or_override = if panel_side == Left {
         Some(BgFillMethod::Spaces)
     } else {
@@ -470,11 +468,11 @@ fn paint_minus_or_plus_panel_line<'a>(
 /// done with spaces. The right panel can be filled with spaces or using ANSI sequences
 /// instructing the terminal emulator to fill the background color rightwards.
 #[allow(clippy::too_many_arguments, clippy::comparison_chain)]
-fn pad_panel_line_to_width<'a>(
+fn pad_panel_line_to_width(
     panel_line: &mut String,
     panel_line_is_empty: bool,
     line_index: Option<usize>,
-    diff_style_sections: &[LineSections<'a, Style>],
+    diff_style_sections: &[LineSections<'_, Style>],
     lines_have_homolog: Option<&[bool]>,
     state: &State,
     panel_side: PanelSide,
@@ -526,6 +524,7 @@ fn pad_panel_line_to_width<'a>(
         }
         Some(BgFillMethod::Spaces) if text_width >= panel_width => (),
         Some(BgFillMethod::Spaces) => panel_line.push_str(
+            #[allow(clippy::unnecessary_to_owned)]
             &fill_style
                 .paint(" ".repeat(panel_width - text_width))
                 .to_string(),
@@ -601,8 +600,8 @@ pub mod tests {
             .with_input(TWO_MINUS_LINES_DIFF)
             .expect_after_header(
                 r#"
-                │ 1  │a = 1         │    │
-                │ 2  │b = 23456     │    │"#,
+                │  1 │a = 1         │    │
+                │  2 │b = 23456     │    │"#,
             );
     }
 
@@ -620,8 +619,8 @@ pub mod tests {
         .with_input(TWO_MINUS_LINES_DIFF)
         .expect_after_header(
             r#"
-            │ 1  │a = 1   │    │
-            │ 2  │b = 234>│    │"#,
+            │  1 │a = 1   │    │
+            │  2 │b = 234>│    │"#,
         );
     }
 
@@ -636,8 +635,8 @@ pub mod tests {
         .with_input(TWO_PLUS_LINES_DIFF)
         .expect_after_header(
             r#"
-            │    │              │ 1  │a = 1         
-            │    │              │ 2  │b = 234567    "#,
+            │    │              │  1 │a = 1         
+            │    │              │  2 │b = 234567    "#,
         );
     }
 
@@ -652,8 +651,8 @@ pub mod tests {
         .explain_ansi()
         .with_input(TWO_PLUS_LINES_DIFF)
         .expect_after_header(r#"
-        (blue)│(88)    (blue)│(normal)              (blue)│(28) 1  (blue)│(231 22)a (203)=(231) (141)1(normal 22)         (normal)
-        (blue)│(88)    (blue)│(normal)              (blue)│(28) 2  (blue)│(231 22)b (203)=(231) (141)234567(normal 22)    (normal)"#);
+        (blue)│(88)    (blue)│(normal)              (blue)│(28)  1 (blue)│(231 22)a (203)=(231) (141)1(normal 22)         (normal)
+        (blue)│(88)    (blue)│(normal)              (blue)│(28)  2 (blue)│(231 22)b (203)=(231) (141)234567(normal 22)    (normal)"#);
 
         DeltaTest::with_args(&[
             "--side-by-side",
@@ -664,8 +663,8 @@ pub mod tests {
         .explain_ansi()
         .with_input(TWO_PLUS_LINES_DIFF)
         .expect_after_header(r#"
-        (blue)│(88)    (blue)│(normal)              (blue) │(28) 1  (blue)│(231 22)a (203)=(231) (141)1(normal)
-        (blue)│(88)    (blue)│(normal)              (blue) │(28) 2  (blue)│(231 22)b (203)=(231) (141)234567(normal)"#);
+        (blue)│(88)    (blue)│(normal)              (blue) │(28)  1 (blue)│(231 22)a (203)=(231) (141)1(normal)
+        (blue)│(88)    (blue)│(normal)              (blue) │(28)  2 (blue)│(231 22)b (203)=(231) (141)234567(normal)"#);
     }
 
     #[test]
@@ -683,8 +682,8 @@ pub mod tests {
         let output = run_delta(TWO_PLUS_LINES_DIFF, &config);
         let mut lines = output.lines().skip(crate::config::HEADER_LEN);
         let (line_1, line_2) = (lines.next().unwrap(), lines.next().unwrap());
-        assert_eq!("│    │         │ 1  │a = 1    ", strip_ansi_codes(line_1));
-        assert_eq!("│    │         │ 2  │b = 2345>", strip_ansi_codes(line_2));
+        assert_eq!("│    │         │  1 │a = 1    ", strip_ansi_codes(line_1));
+        assert_eq!("│    │         │  2 │b = 2345>", strip_ansi_codes(line_2));
     }
 
     #[test]
@@ -695,8 +694,8 @@ pub mod tests {
         let mut lines = output.lines().skip(crate::config::HEADER_LEN);
         let (line_1, line_2) = (lines.next().unwrap(), lines.next().unwrap());
         let sac = strip_ansi_codes; // alias to help with `cargo fmt`-ing:
-        assert_eq!("│    │           │ 1  │a = 1", sac(line_1));
-        assert_eq!("│    │           │ 2  │b = 234567", sac(line_2));
+        assert_eq!("│    │           │  1 │a = 1", sac(line_1));
+        assert_eq!("│    │           │  2 │b = 234567", sac(line_2));
     }
 
     #[test]
@@ -710,8 +709,62 @@ pub mod tests {
         .with_input(ONE_MINUS_ONE_PLUS_LINE_DIFF)
         .expect_after_header(
             r#"
-            │ 1  │a = 1         │ 1  │a = 1
-            │ 2  │b = 2         │ 2  │bb = 2        "#,
+            │  1 │a = 1         │  1 │a = 1
+            │  2 │b = 2         │  2 │bb = 2        "#,
+        );
+    }
+
+    #[test]
+    fn test_two_minus_lines_unicode_truncated() {
+        DeltaTest::with_args(&[
+            "--side-by-side",
+            "--wrap-max-lines",
+            "2",
+            "--width",
+            "16",
+            "--line-fill-method=spaces",
+        ])
+        .set_config(|cfg| cfg.truncation_symbol = ">".into())
+        .with_input(TWO_MINUS_LINES_UNICODE_DIFF)
+        .expect_after_header(
+            r#"
+            │  1 │↵ │    │
+            │    │↵ │    │
+            │    │ >│    │"#,
+        );
+
+        DeltaTest::with_args(&[
+            "--side-by-side",
+            "--wrap-max-lines",
+            "2",
+            "--width",
+            "17",
+            "--line-fill-method=spaces",
+        ])
+        .set_config(|cfg| cfg.truncation_symbol = ">".into())
+        .with_input(TWO_MINUS_LINES_UNICODE_DIFF)
+        .expect_after_header(
+            r#"
+            │  1 │↵ │    │
+            │    │↵ │    │
+            │    │ >│    │"#,
+        );
+
+        DeltaTest::with_args(&[
+            "--side-by-side",
+            "--wrap-max-lines",
+            "2",
+            "--width",
+            "18",
+            "--line-fill-method=spaces",
+        ])
+        .set_config(|cfg| cfg.truncation_symbol = ">".into())
+        .with_input(TWO_MINUS_LINES_UNICODE_DIFF)
+        .expect_after_header(
+            r#"
+            │  1 │一↵│    │
+            │    │二↵│    │
+            │    │三 │    │"#,
         );
     }
 }

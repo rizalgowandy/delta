@@ -1,8 +1,3 @@
-extern crate bitflags;
-
-#[macro_use]
-extern crate error_chain;
-
 mod align;
 mod ansi;
 mod cli;
@@ -29,13 +24,13 @@ mod subcommands;
 
 mod tests;
 
-use std::io::{self, ErrorKind};
+use std::io::{self, ErrorKind, IsTerminal};
 use std::process;
 
 use bytelines::ByteLinesReader;
 
 use crate::delta::delta;
-use crate::utils::bat::assets::{list_languages, HighlightingAssets};
+use crate::utils::bat::assets::list_languages;
 use crate::utils::bat::output::OutputType;
 
 pub fn fatal<T>(errmsg: T) -> !
@@ -44,7 +39,7 @@ where
 {
     #[cfg(not(test))]
     {
-        eprintln!("{}", errmsg);
+        eprintln!("{errmsg}");
         // As in Config::error_exit_code: use 2 for error
         // because diff uses 0 and 1 for non-error.
         process::exit(2);
@@ -54,13 +49,7 @@ where
 }
 
 pub mod errors {
-    error_chain! {
-        foreign_links {
-            Io(::std::io::Error);
-            SyntectError(::syntect::LoadingError);
-            ParseIntError(::std::num::ParseIntError);
-        }
-    }
+    pub use anyhow::{anyhow, Context, Error, Result};
 }
 
 #[cfg(not(tarpaulin_include))]
@@ -74,7 +63,7 @@ fn main() -> std::io::Result<()> {
     // Ignore ctrl-c (SIGINT) to avoid leaving an orphaned pager process.
     // See https://github.com/dandavison/delta/issues/681
     ctrlc::set_handler(|| {})
-        .unwrap_or_else(|err| eprintln!("Failed to set ctrl-c handler: {}", err));
+        .unwrap_or_else(|err| eprintln!("Failed to set ctrl-c handler: {err}"));
     let exit_code = run_app()?;
     // when you call process::exit, no destructors are called, so we want to do it only once, here
     process::exit(exit_code);
@@ -85,8 +74,13 @@ fn main() -> std::io::Result<()> {
 // report that two files differ when delta is called with two positional
 // arguments and without standard input; 2 is used to report a real problem.
 fn run_app() -> std::io::Result<i32> {
-    let assets = HighlightingAssets::new();
-    let opt = cli::Opt::from_args_and_git_config(git_config::GitConfig::try_create(), assets);
+    let assets = utils::bat::assets::load_highlighting_assets();
+    let env = env::DeltaEnv::init();
+    let opt = cli::Opt::from_args_and_git_config(
+        env.clone(),
+        git_config::GitConfig::try_create(&env),
+        assets,
+    );
 
     let subcommand_result = if opt.list_languages {
         Some(list_languages())
@@ -111,7 +105,7 @@ fn run_app() -> std::io::Result<i32> {
         if let Err(error) = result {
             match error.kind() {
                 ErrorKind::BrokenPipe => {}
-                _ => fatal(format!("{}", error)),
+                _ => fatal(format!("{error}")),
             }
         }
         return Ok(0);
@@ -128,23 +122,28 @@ fn run_app() -> std::io::Result<i32> {
     }
 
     let mut output_type =
-        OutputType::from_mode(config.paging_mode, config.pager.clone(), &config).unwrap();
+        OutputType::from_mode(&env, config.paging_mode, config.pager.clone(), &config).unwrap();
     let mut writer = output_type.handle().unwrap();
 
-    if atty::is(atty::Stream::Stdin) {
-        let exit_code = subcommands::diff::diff(
-            config.minus_file.as_ref(),
-            config.plus_file.as_ref(),
-            &config,
-            &mut writer,
-        );
+    if let (Some(minus_file), Some(plus_file)) = (&config.minus_file, &config.plus_file) {
+        let exit_code = subcommands::diff::diff(minus_file, plus_file, &config, &mut writer);
         return Ok(exit_code);
+    }
+
+    if io::stdin().is_terminal() {
+        eprintln!(
+            "\
+    The main way to use delta is to configure it as the pager for git: \
+    see https://github.com/dandavison/delta#get-started. \
+    You can also use delta to diff two files: `delta file_A file_B`."
+        );
+        return Ok(config.error_exit_code);
     }
 
     if let Err(error) = delta(io::stdin().lock().byte_lines(), &mut writer, &config) {
         match error.kind() {
             ErrorKind::BrokenPipe => return Ok(0),
-            _ => eprintln!("{}", error),
+            _ => eprintln!("{error}"),
         }
     };
     Ok(0)
